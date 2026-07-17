@@ -1,0 +1,8 @@
+.env
+life/
+nohup.out
+home_automation.db
+harness/mcp_server.js
+harness/node_modules/
+harness/package-lock.json
+harness/package.json
