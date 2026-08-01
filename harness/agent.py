@@ -348,6 +348,8 @@ def get_state_of_system():
             return True
         if not is_dir and name == "p.md":
             return True
+        if not is_dir and name == "project.md":
+            return True
         return False
 
     def children(d):
@@ -1526,8 +1528,9 @@ def tool_send_telegram(text):
     if len(body) > 4096:
         body = body[:4090] + "\n..."
     url = "https://api.telegram.org/bot" + token + "/sendMessage"
+
     try:
-        r = requests.post(url, json={"chat_id": int(chat_id), "text": body}, timeout=30)
+        r = requests.post(url, json={"chat_id": int(chat_id), "text": body, "parse_mode": "MarkdownV2"}, timeout=30)
     except requests.RequestException as e:
         print(ts() + "  [tool call] send_telegram: network error " + str(e)[:160])
         return "Error: send failed: " + str(e)[:300]
