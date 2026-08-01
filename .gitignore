@@ -6,3 +6,7 @@ harness/mcp_server.js
 harness/node_modules/
 harness/package-lock.json
 harness/package.json
+p.md
+task_report/
+
+__pycache__
