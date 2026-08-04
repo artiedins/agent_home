@@ -90,11 +90,7 @@ def ensure_life():
     if not os.path.isfile(project):
         # Bare fallback if the checked-in constitution is missing.
         with open(project, "w", encoding="utf-8") as f:
-            f.write(
-                "You help the user with personal notes and next actions. "
-                "This directory (/workspace) is yours to organize. "
-                "Use send_telegram for short replies.\n"
-            )
+            f.write("You help the user with personal notes and next actions. " "This directory (/workspace) is yours to organize. " "Use send_telegram for short replies.\n")
         log(f"Wrote default {project}")
 
 
