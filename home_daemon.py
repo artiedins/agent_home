@@ -17,7 +17,10 @@ try:
     from dotenv import load_dotenv
 
     # Load from the daemon's tree so cwd does not matter for TELEGRAM_/PQ_* etc.
-    load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+    # override=True so a stray whitespace/placeholder PQ_API_KEY inherited from
+    # the launching shell cannot shadow the real key in .env (dotenv's default
+    # override=False keeps an already-set var, even a garbage one).
+    load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"), override=True)
 except ImportError:
     pass
 
@@ -121,6 +124,15 @@ def agent_env():
     env["PQ_MODEL"] = "dsv4-flash"
     if not env.get("PQ_PLAYWRIGHT"):
         env["PQ_PLAYWRIGHT"] = "1"
+    # Normalize PQ_API_KEY: a whitespace-only value is truthy, so it sails past
+    # run_agent.sh's -n test and agent.py's key check and yields an
+    # "Authorization: Bearer " header with an empty token -> OpenRouter 401
+    # "Missing Authentication header". Treat whitespace as unset and say so,
+    # so the failure is loud instead of a confusing 401.
+    key = (env.get("PQ_API_KEY") or "").strip()
+    if not key:
+        log("WARNING: PQ_API_KEY missing or blank in daemon env; the life agent will fail to authenticate")
+    env["PQ_API_KEY"] = key
     return env
 
 
@@ -221,7 +233,7 @@ def process_timers(ctx):
                 traceback.print_exc()
 
         if t.get("interval"):
-            timers.reschedule(t["id"], t["interval"])
+            timers.reschedule_interval(t["id"], t["interval"])
             log(f"Rescheduled {name} for {t['interval']}s")
         else:
             timers.delete(t["id"])

@@ -97,31 +97,41 @@ def timer_high_demand_reminder(ctx, timer):
 
 
 def schedule_sun_timers():
-    """Schedule timers for today's sun angle crossings."""
-    # Cancel any existing sun timers
-    timers.cancel(name="sun_crossing")
+    """Schedule timers for today's and tomorrow's sun angle crossings."""
+    # Cancel pending sun timers, but keep ones already due so a late recompute
+    # does not silently drop a crossing that is about to fire.
+    now_ts = __import__("time").time()
+    for t in timers.list_all():
+        if t["name"] == "sun_crossing" and t["fire_at"] > now_ts:
+            timers.delete(t["id"])
 
-    # Get crossing times for today
-    crossings = sun.get_crossing_times()
+    # Get crossing times for today and tomorrow. Scheduling tomorrow's too
+    # means a recompute that runs after this morning's crossing still
+    # schedules the next morning's rising message.
+    from datetime import datetime, timedelta
+
+    now = datetime.now(sun.tz)
     scheduled = 0
-    for t, direction in crossings:
-        delay = sun.seconds_until(t)
-        if delay > 0:
-            timers.add("sun_crossing", delay_sec=delay, data={"direction": direction})
-            scheduled += 1
+    for offset in (0, 1):
+        date = now.date() + timedelta(days=offset)
+        for t, direction in sun.get_crossing_times(date):
+            delay = sun.seconds_until(t)
+            if delay > 0:
+                timers.add("sun_crossing", delay_sec=delay, data={"direction": direction})
+                scheduled += 1
 
-    # Schedule daily recompute at 4am if not already scheduled
+    # Keep the daily recompute anchored to 4am. If it fires later in the day it
+    # skips the morning crossing and rising messages stop; re-anchor whenever
+    # this runs so any drift heals on daemon start and after each daily fire.
     existing = timers.list_all()
-    has_schedule = any(t["name"] == "sun_daily_schedule" for t in existing)
-    if not has_schedule:
-        # Compute seconds until next 4am
-        from datetime import datetime, timedelta
-
-        now = datetime.now(sun.tz)
-        next_4am = now.replace(hour=4, minute=0, second=0, microsecond=0)
-        if next_4am <= now:
-            next_4am += timedelta(days=1)
-        delay = (next_4am - now).total_seconds()
+    daily = next((t for t in existing if t["name"] == "sun_daily_schedule"), None)
+    next_4am = now.replace(hour=4, minute=0, second=0, microsecond=0)
+    if next_4am <= now:
+        next_4am += timedelta(days=1)
+    delay = (next_4am - now).total_seconds()
+    if daily:
+        timers.reschedule(daily["id"], delay)
+    else:
         timers.add("sun_daily_schedule", delay_sec=delay, interval_sec=24 * 60 * 60)
 
     return scheduled

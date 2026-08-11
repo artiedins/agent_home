@@ -65,6 +65,28 @@ def reschedule(timer_id, delay_sec):
     c.close()
 
 
+def reschedule_interval(timer_id, interval_sec):
+    """Push a repeating timer forward from its scheduled fire time by interval.
+
+    Missed cycles are skipped instead of shifting the schedule later, so a
+    daily timer keeps its time of day even if the daemon was down when it was
+    due. Rescheduling from the actual fire time would let the timer drift
+    permanently (e.g. a 4am job pushed to mid-afternoon).
+    """
+    c = _conn()
+    now = time.time()
+    row = c.execute("SELECT fire_at FROM timers WHERE id=?", (timer_id,)).fetchone()
+    if row is None:
+        c.close()
+        return
+    fire_at = row["fire_at"]
+    while fire_at <= now:
+        fire_at += interval_sec
+    c.execute("UPDATE timers SET fire_at=? WHERE id=?", (fire_at, timer_id))
+    c.commit()
+    c.close()
+
+
 def delete(timer_id):
     """Delete a timer by id."""
     c = _conn()

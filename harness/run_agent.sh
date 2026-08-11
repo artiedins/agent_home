@@ -59,7 +59,10 @@ ENV_ARGS=()
 if [ -n "${PQ_MODEL:-}" ]; then
     ENV_ARGS+=(--setenv PQ_MODEL "$PQ_MODEL")
 fi
-if [ -n "${PQ_API_KEY:-}" ]; then
+# whitespace-only keys are truthy but produce an empty Bearer token (OpenRouter
+# 401 "Missing Authentication header"); treat them as unset so agent.py's own
+# "PQ_API_KEY is required" error fires instead.
+if [ -n "${PQ_API_KEY//[[:space:]]/}" ]; then
     ENV_ARGS+=(--setenv PQ_API_KEY "$PQ_API_KEY")
 fi
 if [ -n "${PQ_PLAYWRIGHT:-}" ]; then
