@@ -8,7 +8,7 @@
 # if project_dir is omitted, the current working directory is used.
 #
 # env vars:
-#   PQ_MODEL             - which model to use (default: dsv4-nitro)
+#   PQ_MODEL             - which model to use (default set in agent.py)
 #   PQ_API_KEY           - single API key for any model that needs auth
 #   PQ_PLAYWRIGHT        - 1 to enable web search via headed Chrome, 0 to disable
 #   TELEGRAM_BOT_TOKEN   - optional; enables send_telegram tool in agent
@@ -61,8 +61,9 @@ if [ -n "${PQ_MODEL:-}" ]; then
 fi
 # whitespace-only keys are truthy but produce an empty Bearer token (OpenRouter
 # 401 "Missing Authentication header"); treat them as unset so agent.py's own
-# "PQ_API_KEY is required" error fires instead.
-if [ -n "${PQ_API_KEY//[[:space:]]/}" ]; then
+# "PQ_API_KEY is required" error fires instead. the :- default matters: this
+# script runs with set -u and a truly absent var would abort here.
+if [ -n "${PQ_API_KEY:-}" ] && [ -n "${PQ_API_KEY//[[:space:]]/}" ]; then
     ENV_ARGS+=(--setenv PQ_API_KEY "$PQ_API_KEY")
 fi
 if [ -n "${PQ_PLAYWRIGHT:-}" ]; then

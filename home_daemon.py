@@ -121,7 +121,7 @@ def agent_env():
     # Inherit process env (dotenv-loaded). Force the cash-saving life-bot model so
     # an outer coding harness PQ_MODEL cannot leak into phone helper jobs.
     env = os.environ.copy()
-    env["PQ_MODEL"] = "dsv4-flash"
+    env["PQ_MODEL"] = "go-glm53f"
     if not env.get("PQ_PLAYWRIGHT"):
         env["PQ_PLAYWRIGHT"] = "1"
     # Normalize PQ_API_KEY: a whitespace-only value is truthy, so it sails past
@@ -380,7 +380,7 @@ def process_message(ctx, client, msg):
 def main():
     log("Starting home automation daemon...")
     log(f"STT model={transcribe.MODEL} device={transcribe.DEVICE} dtype={transcribe.DTYPE} " f"(lazy-load on first voice note)")
-    log(f"Agent harness={HARNESS_RUN} life={LIFE_DIR} " f"PQ_MODEL={os.environ.get('PQ_MODEL', 'dsv4-flash')} " f"PQ_PLAYWRIGHT={os.environ.get('PQ_PLAYWRIGHT', '1')}")
+    log(f"Agent harness={HARNESS_RUN} life={LIFE_DIR} " f"PQ_MODEL={os.environ.get('PQ_MODEL', 'go-glm53f')} " f"PQ_PLAYWRIGHT={os.environ.get('PQ_PLAYWRIGHT', '1')}")
 
     os.makedirs(MEDIA_DIR, exist_ok=True)
     log(f"Media directory: {os.path.abspath(MEDIA_DIR)}")
