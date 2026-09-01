@@ -8,5 +8,5 @@ harness/package-lock.json
 harness/package.json
 p.md
 task_report/
-
+previous_sessions/
 __pycache__

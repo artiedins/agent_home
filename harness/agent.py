@@ -62,20 +62,33 @@ _PROVIDER = _cfg("provider")
 # anonymously (key sent only when present).
 _API_KEY = os.environ.get("PQ_API_KEY")
 
+# Agent identity, sent as User-Agent on every request to every provider.
+# dax (opencode) publicly asked agent builders to set an honest custom user
+# agent because spoofed or missing UAs are the main fraud signal on OpenCode
+# Go/Zen (x.com/thdxr/status/2094606303393906912). We previously sent
+# "HermesAgent/0.20.5" - exactly the spoof pattern he described - so all
+# Hermes strings are gone. Format follows RFC 9110 product tokens:
+# name/version plus a comment carrying repo and contact. Plain ASCII, no
+# HTML, well under 256 chars (whatismybrowser UA best practices).
+AGENT_NAME = "pq-agent"
+AGENT_VERSION = "1.0.0"
+AGENT_REPO_URL = "https://github.com/artiedins/pq_agent"
+AGENT_CONTACT = "artiedins"
+USER_AGENT = AGENT_NAME + "/" + AGENT_VERSION + " (+" + AGENT_REPO_URL + "; contact " + AGENT_CONTACT + ")"
+
 if _PROVIDER == "openrouter":
     if not _API_KEY:
         sys.exit("Error: PQ_API_KEY is required for model '" + MODEL_ID + "' (OpenRouter).")
     _API_URL = "https://openrouter.ai/api/v1/chat/completions"
-    # Attribution matches NousResearch/hermes-agent agent/auxiliary_client.py
-    # _OR_HEADERS_BASE / build_or_headers() (plus HermesAgent User-Agent used
-    # on other Hermes provider paths). OpenRouter dashboard reads X-Title.
+    # X-Title and HTTP-Referer are what the OpenRouter dashboard shows as app
+    # attribution; both now point at this repo instead of Hermes.
     _API_HEADERS = {
         "Authorization": "Bearer " + _API_KEY,
         "Content-Type": "application/json",
-        "X-Title": "Hermes Agent",
-        "HTTP-Referer": "https://hermes-agent.nousresearch.com",
+        "X-Title": AGENT_NAME,
+        "HTTP-Referer": AGENT_REPO_URL,
         "X-OpenRouter-Categories": "productivity,cli-agent",
-        "User-Agent": "HermesAgent/0.20.5",
+        "User-Agent": USER_AGENT,
     }
 elif _PROVIDER == "opencode-go":
     if not _API_KEY:
@@ -84,10 +97,14 @@ elif _PROVIDER == "opencode-go":
     _API_HEADERS = {
         "Authorization": "Bearer " + _API_KEY,
         "Content-Type": "application/json",
+        "User-Agent": USER_AGENT,
     }
 elif _PROVIDER == "opencode-zen":
     _API_URL = "https://opencode.ai/zen/v1/chat/completions"
-    _API_HEADERS = {"Content-Type": "application/json"}
+    _API_HEADERS = {
+        "Content-Type": "application/json",
+        "User-Agent": USER_AGENT,
+    }
     if _API_KEY:
         _API_HEADERS["Authorization"] = "Bearer " + _API_KEY
 else:
@@ -2638,7 +2655,6 @@ def make_system_prompt():
         "- Keep working while another tool call could produce evidence or concrete progress. A context warning is advisory, and a context summary is a handoff to fresh context where work continues. Stop when the task is done or the harness sends a wrap-up notice.\n"
         "- Every mid-task response must make at least one tool call, and should usually include short but descriptive text for the user. A text-only reply tells the harness you are done. Context summaries are the one exception: they must be text-only and are required before continuing work with more tool calls.\n"
         "- The harness sends `project.md` (optional) and `p.md` (the task request) right after this prompt. Do not re-read or edit them.\n"
-        "- If `previous_sessions/` exists, read the reports relevant to the task. The file with the largest number is the task report from the most recent session.\n"
         "- `NOTES.md` is working memory. Use it for findings that must survive compaction or a later session. It is yours to organize.\n"
         "\n### Tool Guide\n"
         "- Use only the tools offered in this session. If you remember tools from another harness: use `edit` or `write` instead of `apply_patch`, `bash` instead of `exec_command`, and `todo_write` instead of `update_plan`. There is no `write_stdin`; background jobs deliver output automatically, and `job_output` inspects a job on demand.\n"
@@ -2691,7 +2707,7 @@ def make_system_prompt():
         "- Do not perform a persona or invent stakes. Avoid staged intimacy, defiance, wonder, and urgency; facts carry authority.\n"
         "- Edit for clarity and directness: **trim unnecessary verbosity**.\n"
         "\n### Write Task Report\n"
-        "When the task is done, act as a modern Joseph Grinnell making field notes, and write `task_report/report.md` in clear, direct language. The report is your main communication with the user and your context for future sessions. Bring the user to a deep understanding quickly, and record facts that remain useful for future tasks. Use markdown formatting driven by your good design judgment to make reading the rendered report effortless.\n"
+        "When the task is done, act as a modern Joseph Grinnell making field notes, and write `task_report/report.md` in clear, direct language. The report is your main communication with the user. Bring the user to a deep understanding quickly. Use markdown formatting driven by your good design judgment to make reading the rendered report effortless.\n"
         "Task report template:\n"
         "- **Responses to user:** Lead with answers to user questions, especially anything the user asks for in the task report. Put responses elsewhere only when directed. Omit this section if no response was expected.\n"
         "- **Outcome:** State what was done and what changed in detail: files, decisions or recommendations, checks or results along with what succeeded and failed.\n"
@@ -2820,21 +2836,10 @@ def main():
     TOUCHED["read"].clear()
     TOUCHED["modified"].clear()
 
-    # startup: archive previous task_report then wipe it
+    # startup: wipe the previous task_report. reports are per-run scratch;
+    # nothing is archived (the old previous_sessions/ copy is gone by design).
     task_report_dir = os.path.join(WORKSPACE, "task_report")
-    report_path = os.path.join(task_report_dir, "report.md")
-    previous_sessions_dir = os.path.join(WORKSPACE, "previous_sessions")
     if os.path.isdir(task_report_dir):
-        if os.path.isfile(report_path):
-            os.makedirs(previous_sessions_dir, exist_ok=True)
-            i = 0
-            while i < 1000:
-                candidate = os.path.join(previous_sessions_dir, "{:03d}_report.md".format(i))
-                if not os.path.exists(candidate):
-                    shutil.copy2(report_path, candidate)
-                    print(ts() + "Archived previous report to " + os.path.relpath(candidate, WORKSPACE))
-                    break
-                i += 1
         shutil.rmtree(task_report_dir)
         print(ts() + "Cleared previous task_report.")
 
