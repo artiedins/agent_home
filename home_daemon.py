@@ -46,6 +46,9 @@ ACCEPTED_MIME_MARKERS = ("ogg", "opus")
 ROOT = os.path.dirname(os.path.abspath(__file__))
 LIFE_DIR = os.path.join(ROOT, "life")
 HARNESS_RUN = os.path.join(ROOT, "harness", "run_agent.sh")
+# NOTE (2026-09-05 review): agent.log is append-only and never rotated; it was
+# ~620 KB after ~1 month. No data loss risk, but it will grow forever. Consider
+# truncating or rotating it (e.g. keep the last N runs) on daemon start.
 AGENT_LOG = os.path.join(LIFE_DIR, "agent.log")
 LOCAL_TZ_NAME = "America/Los_Angeles"
 
@@ -118,12 +121,12 @@ def write_p_md(text, source, meta):
 
 
 def agent_env():
-    # Inherit process env (dotenv-loaded). Force the cash-saving life-bot model so
-    # an outer coding harness PQ_MODEL cannot leak into phone helper jobs.
+    # Inherit process env (dotenv-loaded). The model and browser tools are
+    # pinned in harness/agent.py; scrub PQ_MODEL/PQ_PLAYWRIGHT so a value
+    # inherited from an outer coding harness cannot leak into phone helper jobs.
     env = os.environ.copy()
-    env["PQ_MODEL"] = "go-glm53f"
-    if not env.get("PQ_PLAYWRIGHT"):
-        env["PQ_PLAYWRIGHT"] = "1"
+    env.pop("PQ_MODEL", None)
+    env.pop("PQ_PLAYWRIGHT", None)
     # Normalize PQ_API_KEY: a whitespace-only value is truthy, so it sails past
     # run_agent.sh's -n test and agent.py's key check and yields an
     # "Authorization: Bearer " header with an empty token -> OpenRouter 401
@@ -380,7 +383,7 @@ def process_message(ctx, client, msg):
 def main():
     log("Starting home automation daemon...")
     log(f"STT model={transcribe.MODEL} device={transcribe.DEVICE} dtype={transcribe.DTYPE} " f"(lazy-load on first voice note)")
-    log(f"Agent harness={HARNESS_RUN} life={LIFE_DIR} " f"PQ_MODEL={os.environ.get('PQ_MODEL', 'go-glm53f')} " f"PQ_PLAYWRIGHT={os.environ.get('PQ_PLAYWRIGHT', '1')}")
+    log(f"Agent harness={HARNESS_RUN} life={LIFE_DIR} " f"model+browser tools pinned in harness/agent.py, PQ_API_KEY from daemon env")
 
     os.makedirs(MEDIA_DIR, exist_ok=True)
     log(f"Media directory: {os.path.abspath(MEDIA_DIR)}")

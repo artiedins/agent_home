@@ -1,6 +1,7 @@
 import timers
 import rheem_api
 import sun
+import weather
 
 # ============================================================
 # WATER HEATER COMMANDS (wh)
@@ -172,6 +173,63 @@ def timer_sun_daily_schedule(ctx, timer):
 
 
 # ============================================================
+# WEATHER
+# ============================================================
+
+
+def schedule_weather_timer():
+    """Anchor the daily weather message to 8am local, same re-anchor trick
+    as schedule_sun_timers: whichever way this runs (daemon start or daily
+    fire) the next fire lands on the next 8am and skips missed cycles."""
+    from datetime import datetime, timedelta
+
+    now = datetime.now(sun.tz)
+    next_8am = now.replace(hour=8, minute=0, second=0, microsecond=0)
+    if next_8am <= now:
+        next_8am += timedelta(days=1)
+    delay = (next_8am - now).total_seconds()
+
+    existing = next((t for t in timers.list_all() if t["name"] == "weather_daily"), None)
+    if existing:
+        timers.reschedule(existing["id"], delay)
+    else:
+        timers.add("weather_daily", delay_sec=delay, interval_sec=24 * 60 * 60)
+    return next_8am
+
+
+def cmd_weather(ctx, args):
+    """Daily weather + watering message. Usage: weather [init]"""
+    subcmd = args.split()[0].lower() if args else "now"
+
+    if subcmd == "init":
+        next_fire = schedule_weather_timer()
+        return f"Weather message scheduled daily at 8am. Next: {next_fire.strftime('%a %H:%M')}"
+    elif subcmd == "now":
+        try:
+            return weather.daily_message()
+        except Exception as e:
+            return f"Weather fetch failed: {e}"
+    else:
+        return "Usage: weather [now|init]"
+
+
+def timer_weather_daily(ctx, timer):
+    """Called daily at 8am: two forecast messages (Google ensemble + NOAA/NWS),
+    one CSV log line each."""
+    # Re-anchor to wall-clock 8am on every fire (same as the sun schedule);
+    # a bare 86400s interval would drift an hour across DST changes.
+    schedule_weather_timer()
+    try:
+        messages = weather.daily_messages(log=True)
+    except Exception as e:
+        # Loud rather than silent so a broken API key/endpoint gets noticed.
+        return f"Weather update failed: {e}"
+    for msg in messages:
+        ctx.send(msg)
+    return None
+
+
+# ============================================================
 # UTILITY COMMANDS
 # ============================================================
 
@@ -198,6 +256,7 @@ COMMANDS = {
     "timers": cmd_timers,
     "cancel": cmd_cancel,
     "sun": cmd_sun,
+    "weather": cmd_weather,
 }
 
 # Timer name -> handler function
@@ -206,6 +265,7 @@ TIMER_HANDLERS = {
     "high_demand_reminder": timer_high_demand_reminder,
     "sun_crossing": timer_sun_crossing,
     "sun_daily_schedule": timer_sun_daily_schedule,
+    "weather_daily": timer_weather_daily,
 }
 
 # ============================================================
@@ -227,3 +287,4 @@ def handle_unknown(ctx, message):
 def init(ctx):
     """Called once when daemon starts. Set up recurring schedules here."""
     schedule_sun_timers()
+    schedule_weather_timer()
