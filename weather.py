@@ -33,9 +33,8 @@ NWS_UA = "home-daemon-weather/1.0 (github.com/artie/home-automation)"
 
 # A day counts as "rainy" when the median ensemble member puts down at least
 # this much rain. 2 mm is about what 5 minutes of an average residential
-# sprinkler zone applies. This was the old watering threshold; it is now the
-# rain-icon threshold for the Google source.
-SKIP_WATERING_MM = 2.0
+# sprinkler zone applies. This is the rain-icon threshold for the Google source.
+RAIN_MM = 2.0
 
 # NWS hourly forecast has no precip amount, so the rain-icon analog is the
 # max probability-of-precipitation over the day. >= 50% is forecasters
@@ -56,7 +55,7 @@ ICON_SUN = "☀️"
 ICON_CLOUD = "☁️"
 ICON_RAIN = "🌧️"
 
-# Today plus four more days of icons, matching the 5-day watering outlook.
+# Today plus four more days of icons.
 FORECAST_DAYS = 6
 ICON_DAYS = 5
 
@@ -147,7 +146,7 @@ def _google_fetch():
 
 
 def icon_google(day):
-    if day["precip_mm"] >= SKIP_WATERING_MM:
+    if day["precip_mm"] >= RAIN_MM:
         return ICON_RAIN
     if day["cloud_pct"] is not None and day["cloud_pct"] >= CLOUD_MEAN_PCT:
         return ICON_CLOUD
@@ -269,10 +268,17 @@ def render_message(source, high_f, low_f, tomorrow_high_f, icons):
 
 
 def log_prediction(source, day_date, high_f, low_f, tomorrow_high_f, icons, precip=None, pop=None, cloud_pct=None, cloud_hours=None):
-    new_file = not os.path.isfile(CSV_PATH)
+    # One CSV line per source per day. The 8am timer logs, but the manual
+    # 'weather' command and any retry can also reach this; the date check
+    # keeps the file to exactly one row per source per calendar day.
+    if os.path.isfile(CSV_PATH):
+        with open(CSV_PATH, newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                if row.get("source") == source and row.get("date") == day_date.isoformat():
+                    return
     with open(CSV_PATH, "a", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=CSV_FIELDS)
-        if new_file:
+        if not os.path.isfile(CSV_PATH) or os.path.getsize(CSV_PATH) == 0:
             writer.writeheader()
         writer.writerow(
             {
@@ -307,24 +313,9 @@ def daily_messages(log=False):
     return out
 
 
-def watering_note():
-    """Old ensemble watering outlook, kept for the 'weather' command."""
-    days = _google_fetch()
-    window = days[:5]
-    fmt = lambda d: d["date"].strftime("%a %m/%d")
-    wet = [d for d in window if d["precip_mm"] >= SKIP_WATERING_MM]
-    if not wet:
-        return "Watering: no rain expected in the next 5 days. Water on your normal schedule."
-    names = ", ".join(fmt(d) for d in wet)
-    if wet[0]["date"] <= date.today() + timedelta(days=1):
-        return "Watering: rain expected %s. Skip watering for now; let the rain do it." % names
-    return "Watering: rain expected %s. Dry until %s; water today or tomorrow if the soil needs it." % (names, fmt(wet[0]))
-
-
 def daily_message():
-    """Plain-text digest for the 'weather' command: both template messages
-    plus the watering outlook."""
-    return "\n\n".join(daily_messages()) + "\n" + watering_note()
+    """Plain-text digest for the 'weather' command: both 3-line messages."""
+    return "\n\n".join(daily_messages())
 
 
 if __name__ == "__main__":
