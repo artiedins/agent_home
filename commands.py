@@ -214,8 +214,8 @@ def cmd_weather(ctx, args):
 
 
 def timer_weather_daily(ctx, timer):
-    """Called daily at 8am: two 3-line forecast messages (Google ensemble +
-    NOAA/NWS), one CSV log line per source per day."""
+    """Called daily at 8am: three 3-line forecast messages (Google ensemble +
+    NOAA/NWS + MET Norway), one CSV log line per source per day."""
     # Re-anchor to wall-clock 8am on every fire (same as the sun schedule);
     # a bare 86400s interval would drift an hour across DST changes.
     schedule_weather_timer()

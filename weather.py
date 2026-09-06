@@ -31,6 +31,17 @@ ENSEMBLE_URL = "https://ensemble-api.open-meteo.com/v1/ensemble"
 # today/tonight/tomorrow temps, hourly periods for PoP and sky condition.
 NWS_UA = "home-daemon-weather/1.0 (github.com/artie/home-automation)"
 
+# Source 3: MET Norway locationforecast 2.0 (api.met.no, the model behind
+# yr.no). Norwegian Meteorological Institute's own HARMONIE-AROME/post-
+# processing, so an independent third opinion with separate infrastructure
+# from both Open-Meteo and NWS. Free, no API key; their terms only ask for a
+# User-Agent that identifies the application. Resolution: hourly for ~48h,
+# then 6-hourly out to 10 days, so days 3-5 of the icon row rest on 6-hour
+# windows and 2 cloud samples per day instead of hourly data. No
+# probability-of-precipitation field, so the rain rule uses accumulated mm
+# like the Google source.
+METNO_URL = "https://api.met.no/weatherapi/locationforecast/2.0/complete"
+
 # A day counts as "rainy" when the median ensemble member puts down at least
 # this much rain. 2 mm is about what 5 minutes of an average residential
 # sprinkler zone applies. This is the rain-icon threshold for the Google source.
@@ -253,6 +264,97 @@ def nws_message(log=False):
     return msg
 
 
+# ---------------------------------------------------------------- metno --
+
+
+def _metno_local(iso_utc):
+    return datetime.fromisoformat(iso_utc.replace("Z", "+00:00")).astimezone(TZ)
+
+
+def _metno_fetch():
+    """One request, parsed into per-local-day buckets.
+
+    Temps: instant air_temperature plus the max/min carried on each 6h
+    window, so later days (6-hourly data only) still get a real daily
+    high/low. Cloud: instant cloud_area_fraction, only samples inside the
+    11:00-19:00 local window, so the threshold means the same thing as the
+    Google source's. Precip: 1h sums while hourly data lasts, then 6h sums,
+    tracked with a coverage cursor so overlapping windows are never summed.
+    until the aggregate step converts them to F.
+    """
+    url = METNO_URL + "?" + urllib.parse.urlencode({"lat": LAT, "lon": LON})
+    ts = _get_json(url)["properties"]["timeseries"]
+    days = {}
+    cursor = None
+    for p in ts:
+        dt = _metno_local(p["time"])
+        day = days.setdefault(dt.date(), {"temps": [], "win_high": [], "win_low": [], "precip": 0.0, "cloud": []})
+        instant = p["data"]["instant"]["details"]
+        day["temps"].append(instant["air_temperature"])
+        if dt.hour in CLOUD_WINDOW_HOURS:
+            day["cloud"].append(instant["cloud_area_fraction"])
+
+        win1 = (p["data"].get("next_1_hours") or {}).get("details") or {}
+        win6 = (p["data"].get("next_6_hours") or {}).get("details") or {}
+        if win6.get("air_temperature_max") is not None:
+            day["win_high"].append(win6["air_temperature_max"])
+            day["win_low"].append(win6["air_temperature_min"])
+
+        rain1 = win1.get("precipitation_amount")
+        rain6 = win6.get("precipitation_amount")
+        if rain1 is not None:
+            day["precip"] += rain1
+            cursor = dt + timedelta(hours=1)
+        elif rain6 is not None and (cursor is None or dt >= cursor):
+            day["precip"] += rain6
+            cursor = dt + timedelta(hours=6)
+
+    out = {}
+    for d, day in days.items():
+        samples = day["temps"] + day["win_high"] + day["win_low"]
+        out[d] = {
+            "high_f": round(max(samples) * 9 / 5 + 32),
+            "low_f": round(min(samples) * 9 / 5 + 32),
+            "precip_mm": day["precip"],
+            "cloud_pct": round(statistics.mean(day["cloud"])) if day["cloud"] else None,
+        }
+    return out
+
+
+def _metno_icon(day):
+    if day["precip_mm"] >= RAIN_MM:
+        return ICON_RAIN
+    if day["cloud_pct"] is not None and day["cloud_pct"] >= CLOUD_MEAN_PCT:
+        return ICON_CLOUD
+    return ICON_SUN
+
+
+def metno_message(log=False):
+    by_day = _metno_fetch()
+    today = datetime.now(TZ).date()
+    tomorrow = by_day[today + timedelta(days=1)]
+    glyphs = []
+    for offset in range(ICON_DAYS):
+        d = today + timedelta(days=offset)
+        glyphs.append(d.strftime("%A")[0] + _metno_icon(by_day[d]))
+    icons = " ".join(glyphs)
+
+    day0 = by_day[today]
+    msg = render_message("metno", day0["high_f"], tomorrow["low_f"], tomorrow["high_f"], icons)
+    if log:
+        log_prediction(
+            "metno",
+            today,
+            day0["high_f"],
+            tomorrow["low_f"],
+            tomorrow["high_f"],
+            icons,
+            precip=day0["precip_mm"],
+            cloud_pct=day0["cloud_pct"],
+        )
+    return msg
+
+
 # --------------------------------------------------------------- shared --
 
 
@@ -298,9 +400,10 @@ def log_prediction(source, day_date, high_f, low_f, tomorrow_high_f, icons, prec
 
 
 def daily_messages(log=False):
-    """Both forecast messages for the morning push. With log=True one CSV line
-    is appended per message (two per day). If one source fails, the other
-    still goes out and the failure is stated in place so it gets noticed."""
+    """All three forecast messages for the morning push. With log=True one
+    CSV line is appended per message (three per day). If one source fails,
+    the others still go out and the failure is stated in place so it gets
+    noticed."""
     out = []
     try:
         out.append(google_message(log=log))
@@ -310,11 +413,15 @@ def daily_messages(log=False):
         out.append(nws_message(log=log))
     except Exception as e:
         out.append("weather noaa failed: %s" % e)
+    try:
+        out.append(metno_message(log=log))
+    except Exception as e:
+        out.append("weather metno failed: %s" % e)
     return out
 
 
 def daily_message():
-    """Plain-text digest for the 'weather' command: both 3-line messages."""
+    """Plain-text digest for the 'weather' command: the three 3-line messages."""
     return "\n\n".join(daily_messages())
 
 
