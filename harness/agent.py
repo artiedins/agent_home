@@ -32,18 +32,14 @@ from flowmark import reformat_file
 
 
 MODEL_REGISTRY = {
-    "or-gem38": {"provider": "openrouter", "model": "google/gemini-3.8-flash"},
-    "or-grok46": {"provider": "openrouter", "model": "x-ai/grok-4.6"},
-    "go-glm53": {"provider": "opencode-go", "model": "glm-5.3"},
-    "go-dsv4f": {"provider": "opencode-go", "model": "deepseek-v4-flash", "temperature": 0.7},
-    "go-omen": {"provider": "opencode-go", "model": "omen-alpha"},
+    "go-dsv41f": {"provider": "opencode-go", "model": "deepseek-flash"},
 }
 
 
 # Pinned, not read from PQ_MODEL: the home daemon inherits its launching
 # shell's environment, so a stray outer PQ_MODEL must not leak into phone
 # helper jobs. The model is a property of this harness, decided here.
-MODEL_ID = "go-omen"
+MODEL_ID = "go-dsv41f"
 if MODEL_ID not in MODEL_REGISTRY:
     sys.exit("Error: unknown model '" + MODEL_ID + "'. " "Known models: " + ", ".join(sorted(MODEL_REGISTRY.keys())))
 
