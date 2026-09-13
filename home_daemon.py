@@ -52,6 +52,17 @@ HARNESS_RUN = os.path.join(ROOT, "harness", "run_agent.sh")
 AGENT_LOG = os.path.join(LIFE_DIR, "agent.log")
 LOCAL_TZ_NAME = "America/Los_Angeles"
 
+# Drop box for notes pushed into a live agent run: the harness drains one file
+# per note while a run is alive, so a text or voice transcript bypasses the
+# queue. The daemon and the bwrap sandbox share this directory (the life dir is
+# bind-mounted at /workspace), and the dot name keeps it out of the workspace
+# snapshot the model sees at startup.
+INBOX_DIR = os.path.join(LIFE_DIR, ".inbox")
+# A note with no live agent to receive it is reclaimed as a queued job after
+# this long. Guards the case where the agent died between the write and the
+# drain.
+INBOX_STALE_SEC = 20
+
 # One in-flight agent; further freeform notes wait here.
 _agent_proc = None
 _pending = []
@@ -118,6 +129,32 @@ def write_p_md(text, source, meta):
     with open(path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
     return path
+
+
+def write_inbox_message(text, source, meta):
+    # atomic drop for a live run: write beside the target name, then rename, so
+    # the agent never reads a partial file. The nanosecond prefix keeps drain
+    # order deterministic without depending on mtime resolution.
+    os.makedirs(INBOX_DIR, exist_ok=True)
+    message_id = meta.get("message_id", "")
+    received = meta.get("received_at") or local_now_iso()
+    name = "msg-{0:019d}-{1}.md".format(time.time_ns(), str(message_id or "0"))
+    final = os.path.join(INBOX_DIR, name)
+    tmp = final + ".tmp"
+    lines = [
+        f"Source: {source}",
+        f"Telegram message id: {message_id}",
+        f"Received: {received}",
+        "",
+        "---",
+        "",
+        (text or "").rstrip(),
+        "",
+    ]
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+    os.replace(tmp, final)
+    return final
 
 
 def agent_env():
@@ -187,6 +224,54 @@ def poll_agent():
             traceback.print_exc()
 
 
+def reclaim_stranded_inbox(ctx):
+    # At-least-once: a note pushed at the instant a run died has no reader, so
+    # re-queue it instead of leaving it in the inbox forever. Only acts with no
+    # live agent, so it cannot double-deliver against a running run (the harness
+    # unlinks each file as it drains it).
+    #
+    # Not routed through handoff_to_agent on purpose: that would jump the
+    # stranded note ahead of jobs already in _pending, send a second ack to the
+    # phone, and pass the file's header block through as the p.md body.
+    if _agent_proc is not None:
+        return
+    try:
+        names = sorted(n for n in os.listdir(INBOX_DIR) if n.endswith(".md"))
+    except OSError:
+        return
+    now = time.time()
+    for name in names:
+        path = os.path.join(INBOX_DIR, name)
+        try:
+            if now - os.path.getmtime(path) < INBOX_STALE_SEC:
+                continue
+            with open(path, encoding="utf-8", errors="replace") as f:
+                content = f.read()
+            os.unlink(path)
+        except OSError:
+            continue
+        # strip the header block so p.md does not get a second one
+        body = content.split("\n---\n", 1)[1].strip() if "\n---\n" in content else content.strip()
+        if not body:
+            continue
+        log(f"Reclaimed stranded inbox note {name} ({len(body)} chars); no live agent")
+        job = {
+            "text": body,
+            "source": "text",
+            "meta": {"received_at": local_now_iso(), "reclaimed": name},
+        }
+        if _pending or _agent_proc is not None:
+            _pending.append(job)
+            log(f"Reclaimed note queued (queue depth={len(_pending)})")
+            continue
+        try:
+            start_agent(job)
+        except Exception as e:
+            log(f"Failed to start reclaimed agent: {e}")
+            traceback.print_exc()
+            _pending.append(job)
+
+
 def handoff_to_agent(ctx, text, source="voice", meta=None):
     # Drop thin p.md + one background run_agent.sh over life/. Never block the
     # daemon loop on the agent; house cmds and timers keep running.
@@ -205,11 +290,19 @@ def handoff_to_agent(ctx, text, source="voice", meta=None):
 
     poll_agent()
     if _agent_proc is not None:
-        _pending.append(job)
-        log(f"Agent busy; queued job (queue depth={len(_pending)})")
-        # One-line ack so the phone is not silent while a long run touches many files.
-        ctx.send("Queued — still finishing the previous note.")
-        return
+        try:
+            path = write_inbox_message(text, source, meta)
+            log(f"Pushed note to live agent inbox: {path}")
+            # One-line ack so the phone confirms the push fired rather than the
+            # queue; for a time-sensitive code that difference matters.
+            ctx.send("Sent to the live agent.")
+            return
+        except OSError as e:
+            log(f"Inbox write failed ({e}); falling back to the queue")
+            _pending.append(job)
+            log(f"Agent busy; queued job (queue depth={len(_pending)})")
+            ctx.send("Queued — still finishing the previous note.")
+            return
 
     try:
         start_agent(job)
@@ -388,6 +481,8 @@ def main():
     os.makedirs(MEDIA_DIR, exist_ok=True)
     log(f"Media directory: {os.path.abspath(MEDIA_DIR)}")
     ensure_life()
+    os.makedirs(INBOX_DIR, exist_ok=True)
+    log(f"Live-agent inbox: {INBOX_DIR}")
 
     if not os.path.isfile(HARNESS_RUN):
         log(f"ERROR: missing agent launcher {HARNESS_RUN}")
@@ -414,6 +509,7 @@ def main():
         try:
             process_timers(ctx)
             poll_agent()
+            reclaim_stranded_inbox(ctx)
 
             # Media policy is enforced in process_media; no auto-download of photos/etc.
             messages = client.receive(timeout=POLL_TIMEOUT, download_media=False)
@@ -422,6 +518,7 @@ def main():
                 process_message(ctx, client, msg)
 
             poll_agent()
+            reclaim_stranded_inbox(ctx)
 
         except KeyboardInterrupt:
             log("Shutting down...")

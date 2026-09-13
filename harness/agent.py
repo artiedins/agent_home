@@ -202,6 +202,14 @@ DEFAULT_TIMEOUT_MS = 600000
 # of burning LLM round trips; auto-delivery then hands the output over.
 GUARD_WAIT_SECONDS = 30
 
+# the guard wait above is chunked at this granularity so a user note arriving
+# mid-wait is noticed within a few seconds rather than after the whole window
+GUARD_WAIT_SLICE = 5
+
+# foreground bash waits are sliced at this granularity while polling the inbox,
+# so a note can cut a long wait short (see tool_run_command)
+BASH_WAIT_SLICE = 0.5
+
 # Fixed max_tokens for compaction summary responses, regardless of model config.
 # A length-truncated summary is used as-is rather than erroring out.
 COMPACTION_MAX_TOKENS = 32000
@@ -1040,6 +1048,10 @@ def chat(messages, tools, new_messages, state, session_messages):
         # degraded fallback below both need it after new_messages is cleared
         full_history = messages + new_messages
         new_messages.clear()
+        # inbox notes must survive compaction verbatim: a summary paraphrases
+        # away a six-digit code, and codes are exactly what arrives mid-run.
+        # taken before the pretrim so the raw text is what gets re-appended.
+        preserved_inbox = _preserved_inbox(full_history)
         # only compaction input shape: raw history + template prompt (see the
         # module-level note about the removed serialized variant).
         _pretrim_for_compaction(full_history)
@@ -1140,6 +1152,7 @@ def chat(messages, tools, new_messages, state, session_messages):
 
         messages.clear()
         messages += new_session
+        messages += preserved_inbox
 
     else:
         pct = 100 * pre_prompt_total_context / MAX_CONTEXT_LENGTH
@@ -1671,6 +1684,61 @@ def _collect_background_deliveries():
     return notices
 
 
+INBOX_DIR_NAME = ".inbox"
+INBOX_DRAIN_MAX_FILES = 5
+# the home daemon writes this marker as the first line of every note it pushes.
+# it must match home_daemon.py's header and the scan in _preserved_inbox below,
+# so the marker string is load-bearing on both sides.
+INBOX_MARKER = "[user message received mid-run, delivered by the harness]"
+
+
+def _list_inbox(inbox_dir):
+    try:
+        return sorted(n for n in os.listdir(inbox_dir) if n.endswith(".md"))
+    except OSError:
+        return []
+
+
+def peek_user_inbox(inbox_dir=None):
+    # wait loops call this: presence check only, no unlink, no context cost
+    root = inbox_dir or os.path.join(WORKSPACE, INBOX_DIR_NAME)
+    return len(_list_inbox(root)) > 0
+
+
+def drain_user_inbox(inbox_dir=None):
+    # the home daemon drops one file per note here while this run is alive: a
+    # text or voice transcript Artie sends lands in <WORKSPACE>/.inbox instead
+    # of waiting for the next run. files rather than a socket because /workspace
+    # is the only shared writable path between daemon and sandbox, and a
+    # stranded file is visible with ls. verified 2026-09-13 with a bwrap probe:
+    # a host-written file in the bind-mounted dir is drained live inside it.
+    root = inbox_dir or os.path.join(WORKSPACE, INBOX_DIR_NAME)
+    names = _list_inbox(root)
+    notices = []
+    for name in names[:INBOX_DRAIN_MAX_FILES]:
+        path = os.path.join(root, name)
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                body = f.read().strip()
+            os.unlink(path)
+        except OSError:
+            continue
+        if body:
+            notices.append(INBOX_MARKER + "\n" + body)
+    if len(names) > INBOX_DRAIN_MAX_FILES:
+        notices.append("[harness notice] " + str(len(names) - INBOX_DRAIN_MAX_FILES) + " more mid-run user " "messages are still queued in .inbox and arrive after these.")
+    return notices
+
+
+def _preserved_inbox(full_history):
+    # compaction must not paraphrase a note away: the six-digit code that arrives
+    # mid-run is exactly what a summary would round off. notes carrying the
+    # inbox marker are re-appended verbatim after the rebuilt session.
+    # fresh dicts: _pretrim_for_compaction mutates content in place, and these
+    # copies are appended to the rebuilt session after that ran
+    return [{"role": "user", "content": m.get("content")} for m in full_history if m.get("role") == "user" and str(m.get("content", "")).startswith(INBOX_MARKER)]
+
+
 def _resolve_workdir(workdir):
     # defaults to WORKSPACE; relative paths resolve against it, absolute used
     # as-is. only changes where the command starts, not what it may touch.
@@ -1941,6 +2009,46 @@ def _auto_description(command):
     return prog + operand
 
 
+def _is_plain_sleep(command):
+    # the waiting idiom documented in project.md is a bare `sleep N`. anything
+    # else (a build, a test, a pipeline) must not be killed just because a text
+    # message arrived while it ran.
+    return re.match(r"\s*sleep(\s|$)", command or "") is not None
+
+
+def _yield_to_background(proc, out_f, err_f, command, description, start, deadline, yield_s, note=""):
+    # terminal half of the foreground wait: register the PROCS entry and arm the
+    # watchdog for the remaining deadline, then hand back the yield message.
+    # register the PROCS entry BEFORE arming the timer: the watchdog looks the
+    # handle up in PROCS, and a timer firing first would find nothing.
+    PROC_SEQ["n"] += 1
+    handle = "job-" + str(PROC_SEQ["n"])
+    remaining = deadline - time.monotonic()
+    PROCS[handle] = {
+        "proc": proc,
+        "out_f": out_f,
+        "err_f": err_f,
+        "command": command,
+        "description": description,
+        "start": start,
+        "timer": None,
+        "yielded": True,
+    }
+    if remaining > 0:
+        timer = threading.Timer(remaining, _watchdog_kill, args=(handle,))
+        timer.daemon = True
+        timer.start()
+        PROCS[handle]["timer"] = timer
+    partial = truncate_command_text(_read_both(out_f, err_f))
+    print(ts() + "  [tool call] bash: YIELDED " + handle + " | " + description)
+    return (
+        note + "[command still running after " + str(int(yield_s * 1000)) + "ms; it is now managed in the background as " + handle + ". "
+        "Continue with other work and expect the final output to be delivered automatically as a later notification. "
+        "Use job_output to inspect it or job_kill to stop it.]\n\n"
+        "[partial output so far:]\n" + partial
+    )
+
+
 def tool_run_command(command, description="", yield_time_ms=DEFAULT_YIELD_MS, timeoutMs=None, workdir=None, run_in_background=False):
     # Muse-style bash: foreground wait up to yield_time_ms, then the command
     # stays managed in the background with auto-delivered final output.
@@ -2005,9 +2113,22 @@ def tool_run_command(command, description="", yield_time_ms=DEFAULT_YIELD_MS, ti
     # the background watchdog share it, so the kill lands at the deadline, not
     # at deadline + yield. monotonic so wall-clock changes cannot extend it.
     deadline = time.monotonic() + timeout_s
-    try:
-        proc.wait(timeout=min(yield_s, max(0.0, deadline - time.monotonic())))
-    except subprocess.TimeoutExpired:
+    wait_until = time.monotonic() + min(yield_s, max(0.0, deadline - time.monotonic()))
+    interrupted_by_user = False
+    while proc.poll() is None:
+        slice_s = min(BASH_WAIT_SLICE, wait_until - time.monotonic())
+        if slice_s <= 0:
+            break
+        try:
+            proc.wait(timeout=slice_s)
+        except subprocess.TimeoutExpired:
+            pass
+        # a note Artie sends while this command runs is delivered right after
+        # this tool result, so one long wait can hold a page open for minutes
+        if peek_user_inbox():
+            interrupted_by_user = True
+            break
+    if proc.poll() is None:
         if time.monotonic() >= deadline:
             # hard deadline expired before the yield: kill and report now
             _kill_group(proc)
@@ -2017,35 +2138,34 @@ def tool_run_command(command, description="", yield_time_ms=DEFAULT_YIELD_MS, ti
             err_f.close()
             print(ts() + "  [tool call] bash: TIMED OUT | " + description)
             return partial + "\n[error: command exceeded timeoutMs=" + str(int(timeout_s * 1000)) + " and was killed; any partial output is shown above]"
+        if interrupted_by_user:
+            # tier 1: a plain sleep is the documented waiting idiom, so cut it
+            # short - that is the whole point of the sleep.
+            if _is_plain_sleep(command):
+                _kill_group(proc)
+                proc.wait()
+                partial = truncate_command_text(_read_both(out_f, err_f))
+                out_f.close()
+                err_f.close()
+                print(ts() + "  [tool call] bash: SLEEP CUT SHORT | " + description)
+                return partial + "\n[sleep cut short: a user message arrived and was delivered right after this tool result]"
+            # tier 2: anything else keeps running. never kill real work (a build,
+            # a test) because a text arrived; hand it to the background path so
+            # the note delivers now and the command's output arrives later.
+            return _yield_to_background(
+                proc,
+                out_f,
+                err_f,
+                command,
+                description,
+                start,
+                deadline,
+                yield_s,
+                note="[moved to the background: a user message arrived and was delivered right after this tool result. "
+                "The command is still running and its final output will be delivered automatically.]\n\n",
+            )
         # yield: final output arrives as a later auto-delivered notification.
-        # register the PROCS entry BEFORE arming the timer: the watchdog looks
-        # the handle up in PROCS, and a timer firing first would find nothing.
-        PROC_SEQ["n"] += 1
-        handle = "job-" + str(PROC_SEQ["n"])
-        remaining = deadline - time.monotonic()
-        PROCS[handle] = {
-            "proc": proc,
-            "out_f": out_f,
-            "err_f": err_f,
-            "command": command,
-            "description": description,
-            "start": start,
-            "timer": None,
-            "yielded": True,
-        }
-        if remaining > 0:
-            timer = threading.Timer(remaining, _watchdog_kill, args=(handle,))
-            timer.daemon = True
-            timer.start()
-            PROCS[handle]["timer"] = timer
-        partial = truncate_command_text(_read_both(out_f, err_f))
-        print(ts() + "  [tool call] bash: YIELDED " + handle + " | " + description)
-        return (
-            "[command still running after " + str(int(yield_s * 1000)) + "ms; it is now managed in the background as " + handle + ". "
-            "Continue with other work and expect the final output to be delivered automatically as a later notification. "
-            "Use job_output to inspect it or job_kill to stop it.]\n\n"
-            "[partial output so far:]\n" + partial
-        )
+        return _yield_to_background(proc, out_f, err_f, command, description, start, deadline, yield_s)
     output = _read_both(out_f, err_f)
     out_f.close()
     err_f.close()
@@ -2825,8 +2945,9 @@ def make_system_prompt():
         "\n## Agent Guide\n"
         "- Keep working while another tool call could produce evidence or concrete progress. A context warning is advisory, and a context summary is a handoff to fresh context where work continues. Stop when the task is done or the harness sends a wrap-up notice.\n"
         "- Every mid-task response must make at least one tool call, and should usually include short but descriptive text for the user. A text-only reply tells the harness you are done. Context summaries are the one exception: they must be text-only and are required before continuing work with more tool calls.\n"
+        '- Waiting for the user mid-run: this run receives the user\'s messages while it works. They arrive as user messages appended right after the tool results of the turn in flight, so you see them on your next turn; treat them as genuine user input. To wait for one, ask with send_telegram, then call bash with a plain short sleep (e.g. {"command": "sleep 20", "yield_time_ms": 25000}). A plain sleep returns early when the reply arrives; anything else you run with a long yield_time_ms moves to the background rather than being killed. Keep any browser or process state you need alive inside this run; the sandbox kills everything at run end, so never end the run to wait.\n'
         "- The harness sends `project.md` (optional) and `p.md` (the task request) as the initial prompt right after this prompt. Do not re-read or edit them.\n"
-        "- The task request must be inferred from the initial prompt and the workspace. There is no way to ask the user mid-run, but uncertainties can be noted in the task report.\n"
+        "- The task request must be inferred from the initial prompt and the workspace; if something is uncertain, note it in the task report. You can also ask the user mid-run: send the question with `send_telegram`, then wait with a short `bash` sleep (see `project.md`). A message the user sends while this run is alive is appended to the conversation right after the tool results of the turn in flight, and a plain `sleep` is cut short when the reply arrives.\n"
         "- `task_report/` is per-run scratch: the harness wipes it at startup and nothing is archived. Reports are debug for the user to read after the run. Never store durable memory in `task_report/`; put anything a future run must keep in ordinary workspace files or `NOTES.md`.\n"
         "- `NOTES.md` is working memory. Use it for findings that must survive compaction or a later session. It is yours to organize.\n"
         "\n### Tool Guide\n"
@@ -3173,6 +3294,13 @@ def main():
 
     try:
         while True:
+            # user notes first: a message Artie sent while the previous request
+            # was in flight must reach the model in the next request, ahead of
+            # harness notices about the harness's own background work
+            for notice in drain_user_inbox():
+                print(ts() + "  [inbox] mid-run user message (" + str(len(notice)) + " chars) delivered")
+                new_messages.append({"role": "user", "content": notice})
+
             # auto-deliver final output of finished background commands as
             # notifications; the model should never have to poll for completion
             for notice in _collect_background_deliveries():
@@ -3279,6 +3407,12 @@ def main():
                 else:
                     new_messages.append({"role": "user", "content": status})
 
+                # after the status line so the note is its own user message, and
+                # after every tool result so the tool_calls/tool pairing holds
+                for notice in drain_user_inbox():
+                    print(ts() + "  [inbox] mid-run user message (" + str(len(notice)) + " chars) delivered after tool results")
+                    new_messages.append({"role": "user", "content": notice})
+
                 # soft budget notices
                 print("TTC", tool_calls_done, flush=True)
                 ctx_tokens = state["last_post_tokens"]
@@ -3378,18 +3512,43 @@ def main():
             # model waiting for auto-delivered output, not a finish: wait
             # in-process (bounded) instead of burning round trips. start_process
             # servers are exempt; a server that never exits must not stall.
+            # the wait is sliced so a note Artie sends now is picked up in about
+            # GUARD_WAIT_SLICE seconds instead of after the whole guard window.
             while any(e.get("yielded") and e["proc"].poll() is None for e in PROCS.values()):
                 # Each yielded job has a watchdog deadline. Do not spend model turns
                 # waiting, and do not let an existing report bypass its output.
                 for e in list(PROCS.values()):
                     if e.get("yielded") and e["proc"].poll() is None:
                         try:
-                            e["proc"].wait(timeout=GUARD_WAIT_SECONDS)
+                            e["proc"].wait(timeout=GUARD_WAIT_SLICE)
                         except subprocess.TimeoutExpired:
                             pass
+                if peek_user_inbox():
+                    break
+            # end-of-turn drain. two cases, both of which used to strand a note
+            # and lose the run that asked for it: a note that arrived while the
+            # model was generating its give-up text (the Target phone-code case),
+            # and a note that landed during the guard wait above. continuing
+            # instead of exiting is what delivers it.
+            inbox_notices = drain_user_inbox()
+            if inbox_notices:
+                for notice in inbox_notices:
+                    print(ts() + "  [inbox] mid-run user message delivered at end of turn; continuing run")
+                    new_messages.append({"role": "user", "content": notice})
+                continue
             deliveries = _collect_background_deliveries()
             if deliveries:
                 new_messages.extend({"role": "user", "content": notice} for notice in deliveries)
+                continue
+
+            # final-turn guard: closes the sub-millisecond window between the
+            # drain above and acceptance below. sub-millisecond only because the
+            # end-of-turn drain is unconditional; cheap, so kept.
+            inbox_notices = drain_user_inbox()
+            if inbox_notices:
+                for notice in inbox_notices:
+                    print(ts() + "  [inbox] mid-run user message delivered at run end; continuing run")
+                    new_messages.append({"role": "user", "content": notice})
                 continue
 
             # final text reply: require an adequate report before accepting it
