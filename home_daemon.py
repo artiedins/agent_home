@@ -31,6 +31,7 @@ import timers
 import rheem_api
 import commands
 import transcribe
+import weather_station
 
 # How often to poll telegram (seconds). Longer = less battery/cpu but slower response.
 POLL_TIMEOUT = 10
@@ -484,6 +485,12 @@ def main():
     os.makedirs(INBOX_DIR, exist_ok=True)
     log(f"Live-agent inbox: {INBOX_DIR}")
 
+    # Weather station ingest. In its own thread so the one command
+    # `nohup python3 -u home_daemon.py &` covers Telegram and the roof station
+    # both. A bind failure (usually a daemon that is already running) logs and
+    # returns None; it must never take the daemon down with it.
+    weather_station.start(log=log)
+
     if not os.path.isfile(HARNESS_RUN):
         log(f"ERROR: missing agent launcher {HARNESS_RUN}")
         sys.exit(1)
@@ -503,7 +510,10 @@ def main():
     commands.init(ctx)
 
     log("Ready. Waiting for commands / voice notes / freeform notes...")
-    ctx.send("Home daemon started. Send 'help' for house commands. " "Voice notes and freeform text go to the life helper agent.")
+    ws_note = (
+        f"Weather station ingest listening on port {weather_station.PORT}." if weather_station.LISTENER is not None else f"Weather station ingest NOT started (port {weather_station.PORT} busy?)."
+    )
+    ctx.send(f"Home daemon started. {ws_note} Send 'help' for house commands. " "Voice notes and freeform text go to the life helper agent.")
 
     while True:
         try:

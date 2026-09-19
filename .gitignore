@@ -2,11 +2,13 @@
 life/
 nohup.out
 home_automation.db
-harness/mcp_server.js
+weather_station.db*
 harness/node_modules/
 harness/package-lock.json
 harness/package.json
 p.md
 task_report/
 previous_sessions/
+NOTES.md
 __pycache__
+weather_predictions.csv
