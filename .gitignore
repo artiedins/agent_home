@@ -1,6 +1,8 @@
 .env
 life/
 nohup.out
+daemon.log
+agent.log
 home_automation.db
 weather_station.db*
 harness/node_modules/
@@ -12,3 +14,4 @@ previous_sessions/
 NOTES.md
 __pycache__
 weather_predictions.csv
+temp_transition_state.json

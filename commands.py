@@ -5,6 +5,7 @@ from datetime import datetime
 import timers
 import rheem_api
 import sun
+import temp_transition
 import weather
 import weather_station
 
@@ -333,6 +334,7 @@ def _ws_status():
     if h["today"]:
         lines.append("Today: %s, %.0f%% of the day" % (_n_reports(h["today"]["samples"]), h["today"]["samples"] * 60 / 86400 * 100))
     lines.append("Database: %s (%d ingest runs logged)" % (os.path.basename(weather_station.DB_PATH), h["runs"]))
+    lines.append("Temp alert: %s" % temp_transition.status())
     if h["counter_resets"]:
         lines.append("Rain counter resets logged: %d (RAIN button pressed)" % h["counter_resets"])
     return "\n".join(lines)
@@ -409,6 +411,31 @@ def timer_ws_health(ctx, timer):
     )
 
 
+# Inside/outside crossings. This was a 30 s poll, which cost a DB read every half
+# minute for a check whose debounce is 15 minutes per direction: a crossing could
+# wait up to 5 minutes without changing any alert that got sent. Threshold,
+# per-direction debounce, and the state file are in temp_transition.
+TEMP_ALERT_POLL_SEC = 5 * 60
+
+
+def schedule_temp_alert():
+    """Keep the crossing check on its grid across daemon restarts."""
+    existing = next((t for t in timers.list_all() if t["name"] == "temp_alert"), None)
+    if existing:
+        timers.reschedule_interval(existing["id"], TEMP_ALERT_POLL_SEC)
+    else:
+        timers.add("temp_alert", delay_sec=TEMP_ALERT_POLL_SEC, interval_sec=TEMP_ALERT_POLL_SEC)
+
+
+def timer_temp_alert(ctx, timer):
+    """Send one HTML message per crossing temp_transition reports. Sent here
+    rather than returned, because process_timers sends returns as plain text and
+    the message carries <b>/<i> markup."""
+    for msg in temp_transition.check(temp_transition.Settings(), log=getattr(ctx, "log", None)):
+        ctx.send(msg, parse_mode="HTML")
+    return None
+
+
 # ============================================================
 # UTILITY COMMANDS
 # ============================================================
@@ -448,6 +475,7 @@ TIMER_HANDLERS = {
     "sun_daily_schedule": timer_sun_daily_schedule,
     "weather_daily": timer_weather_daily,
     "ws_health": timer_ws_health,
+    "temp_alert": timer_temp_alert,
 }
 
 # ============================================================
@@ -471,3 +499,4 @@ def init(ctx):
     schedule_sun_timers()
     schedule_weather_timer()
     schedule_ws_health()
+    schedule_temp_alert()

@@ -47,10 +47,13 @@ ACCEPTED_MIME_MARKERS = ("ogg", "opus")
 ROOT = os.path.dirname(os.path.abspath(__file__))
 LIFE_DIR = os.path.join(ROOT, "life")
 HARNESS_RUN = os.path.join(ROOT, "harness", "run_agent.sh")
-# NOTE (2026-09-05 review): agent.log is append-only and never rotated; it was
-# ~620 KB after ~1 month. No data loss risk, but it will grow forever. Consider
-# truncating or rotating it (e.g. keep the last N runs) on daemon start.
-AGENT_LOG = os.path.join(LIFE_DIR, "agent.log")
+# Agent stdout/stderr capture, one file per run appended. It sits in the
+# daemon's own tree, outside the notebook the model reads (life/ is mounted at
+# /workspace, this file is not), and beside daemon.log so one command follows
+# both: `tail -f daemon.log agent.log`. It was life/agent.log, then
+# logs/agent.log; the 2026-11-08 move back to the root was Artie's call.
+# No cap and no rotation: he reads it, then deletes or truncates it by hand.
+AGENT_LOG = os.path.join(ROOT, "agent.log")
 LOCAL_TZ_NAME = "America/Los_Angeles"
 
 # Drop box for notes pushed into a live agent run: the harness drains one file
@@ -81,8 +84,14 @@ class Context:
     def rheem(self):
         return rheem_api
 
-    def send(self, msg):
-        self._client.send(msg)
+    @property
+    def log(self):
+        # Resolved at call time so commands can log lines into nohup.out without
+        # importing this module (which imports commands).
+        return log
+
+    def send(self, msg, parse_mode=None):
+        self._client.send(msg, parse_mode=parse_mode)
 
     def ask(self, question, timeout=300):
         return self._client.ask(question, timeout=timeout)
@@ -177,6 +186,13 @@ def agent_env():
     return env
 
 
+def open_agent_log():
+    # Append only: a restart or a crash can never lose a line, and nothing here
+    # caps or rotates the file. Artie reads it and trims it by hand once he is
+    # done with the history.
+    return open(AGENT_LOG, "a", encoding="utf-8")
+
+
 def start_agent(job):
     global _agent_proc
     text = job["text"]
@@ -184,7 +200,7 @@ def start_agent(job):
     meta = job.get("meta") or {}
     p_path = write_p_md(text, source, meta)
     ensure_life()
-    log_f = open(AGENT_LOG, "a", encoding="utf-8")
+    log_f = open_agent_log()
     log_f.write("\n===== agent start {0} source={1} msg={2} =====\n".format(local_now_iso(), source, meta.get("message_id", "")))
     log_f.flush()
     try:
@@ -478,6 +494,7 @@ def main():
     log("Starting home automation daemon...")
     log(f"STT model={transcribe.MODEL} device={transcribe.DEVICE} dtype={transcribe.DTYPE} " f"(lazy-load on first voice note)")
     log(f"Agent harness={HARNESS_RUN} life={LIFE_DIR} " f"model+browser tools pinned in harness/agent.py, PQ_API_KEY from daemon env")
+    log(f"Agent stdout capture: {AGENT_LOG} (appended, never rotated)")
 
     os.makedirs(MEDIA_DIR, exist_ok=True)
     log(f"Media directory: {os.path.abspath(MEDIA_DIR)}")

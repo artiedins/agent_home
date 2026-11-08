@@ -72,7 +72,15 @@ def reschedule_interval(timer_id, interval_sec):
     daily timer keeps its time of day even if the daemon was down when it was
     due. Rescheduling from the actual fire time would let the timer drift
     permanently (e.g. a 4am job pushed to mid-afternoon).
+
+    The stored interval is updated too, not just the fire time. Before
+    2026-11-08 it was not, so a timer created at 30 s kept firing every 30 s
+    after the code asked for 5 minutes: the next reschedule falls back on the
+    interval column (see home_daemon's timer loop), which still held the old
+    value.
     """
+    if not interval_sec or interval_sec <= 0:
+        return
     c = _conn()
     now = time.time()
     row = c.execute("SELECT fire_at FROM timers WHERE id=?", (timer_id,)).fetchone()
@@ -82,7 +90,7 @@ def reschedule_interval(timer_id, interval_sec):
     fire_at = row["fire_at"]
     while fire_at <= now:
         fire_at += interval_sec
-    c.execute("UPDATE timers SET fire_at=? WHERE id=?", (fire_at, timer_id))
+    c.execute("UPDATE timers SET fire_at=?, interval=? WHERE id=?", (fire_at, interval_sec, timer_id))
     c.commit()
     c.close()
 

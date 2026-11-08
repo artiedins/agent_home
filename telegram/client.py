@@ -215,9 +215,9 @@ class TelegramClient:
     def is_registered(self):
         return bool(self.config.bot_token and self.config.chat_id)
 
-    def send(self, message, chat_id=None):
+    def send(self, message, chat_id=None, parse_mode=None):
         chat_id = chat_id or self.config.chat_id
-        self.api.send_message(chat_id, message)
+        self.api.send_message(chat_id, message, parse_mode=parse_mode)
         return True
 
     def notify(self, message, prefix=True):
