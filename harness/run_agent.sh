@@ -1,51 +1,55 @@
 #!/usr/bin/env bash
 
-# run_agent.sh - launch agent.py inside a bubblewrap sandbox (home daemon build)
+# Launch agent.py inside bubblewrap. The project is writable at /workspace;
+# harness code is read-only at /agent. Network access and host Chrome are shared.
+# GPU device nodes are exposed when ENABLE_GPU=1 (no-op on hosts without them).
+# This is filesystem/process isolation, not isolation from all host capabilities.
+# PQ_MODEL selects the registry entry, PQ_API_KEY its provider key, and
+# PQ_PLAYWRIGHT the web backend: 1 (default) = the shared headed Chrome, driven
+# by openCode browse when it is installed and by the Node CDP server otherwise;
+# 2 = lightweight HTTP tools (web_lite.py; for low-memory hosts, no
+# Node/browser needed); 0 = no built-in web tools.
 #
-# usage: bash run_agent.sh [project_dir]
-#
-# if project_dir is omitted, the current working directory is used.
-#
-# env vars:
-#   PQ_API_KEY           - single API key for the model provider (required)
-#   TELEGRAM_BOT_TOKEN   - enables the send_telegram tool in agent
-#   TELEGRAM_CHAT_ID     - fixed destination for send_telegram
-#
-# The model and browser tools are pinned in agent.py; PQ_MODEL and
-# PQ_PLAYWRIGHT are deliberately not passed through, so a stray value in the
-# daemon's inherited environment cannot change them.
-#
-# the agent code lives here (read-only inside sandbox at /agent)
-# the project dir is where the agent reads and writes (read-write at /workspace)
-#
-# protects: $HOME entirely invisible, only project dir is writable
-# .pq is shadowed with an empty tmpfs so the agent cannot see harness files
-# allows: full network (the browser MCP connects to the host Chrome over CDP,
-# and the host music server on localhost:8765 is reachable)
-# no playwright browser-cache bind: the MCP server connects over CDP and does
-# not launch a downloaded browser
-#
-# host capabilities, always on for the home music box (no opt-in toggles):
-#   sound     - /dev/snd (direct ALSA) plus the user session's PipeWire /
-#              PulseAudio sockets (/run/user/UID) so the agent's players are
-#              heard through the machine's speakers/headphones
-#   music     - host ~/Music read-only at /music; the music server translates
+# Home-box additions on top of the reference launcher, all always on:
+#   telegram - TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID are passed through so
+#              agent.py can offer send_telegram to the phone; without them the
+#              tool and its prompt lines are left out
+#   sound    - /dev/snd plus the user session's PipeWire/PulseAudio sockets, so
+#              a player started in the sandbox is heard on the machine
+#   music    - host ~/Music read-only at /music; the music server translates
 #              /music paths to the real library and serves its HTTP API on
 #              localhost:8765
-#   HF cache  - host ~/.cache/huggingface read-only at /hf-cache with
+#   HF cache - host ~/.cache/huggingface read-only at /hf-cache with
 #              HF_HUB_OFFLINE=1, so local models load without any download
+#   .pq      - when the project directory has one, it is shadowed with an empty
+#              tmpfs so the agent cannot read whatever the operator left there;
+#              when it is absent, nothing is mounted and no .pq is created
 
 set -euo pipefail
 
-AGENT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Host-specific capabilities are opt-in. Edit these settings for this machine.
+# The interpreter is the system python3; harness deps (requests, bs4, flowmark)
+# must be importable from it. On PEP 668 hosts (Debian 12+/Raspberry Pi OS
+# Bookworm+) that means `sudo pip3 install --break-system-packages ...`, which
+# lands in /usr/local/lib/python3.X/dist-packages, inside the /usr bind below.
+ENABLE_AUDIO=1
+ENABLE_MUSIC=1
+ENABLE_HF_CACHE=1
+HF_OFFLINE=1
+# GPU access: bind the NVIDIA character devices and the DRM render nodes into the
+# sandbox, which bwrap's --dev does not provide. Nothing is bound when the nodes
+# are absent, so this stays correct on a host without a GPU. The KMS master nodes
+# (/dev/dri/card*) are deliberately left out: they would let the sandbox take over
+# the display, and nothing here needs them.
+ENABLE_GPU=1
 
+AGENT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [ $# -eq 0 ]; then
     PROJECT_DIR="$(pwd)"
 elif [ $# -eq 1 ]; then
     PROJECT_DIR="$(cd "$1" && pwd)"
 else
     echo "usage: bash run_agent.sh [project_dir]" >&2
-    echo "  if project_dir is omitted, the current working directory is used." >&2
     exit 1
 fi
 
@@ -54,40 +58,137 @@ if ! command -v bwrap &>/dev/null; then
     exit 1
 fi
 
-# audio: the logged-in desktop session's runtime dir holds the PipeWire and
-# PulseAudio sockets (plus the dbus session bus). Binding it lets mpv/pactl
-# reach the same sound server the user hears through. This also exposes the
-# microphone to the sandbox - acceptable on a home music box. When no desktop
-# session is logged in the dir is absent and --bind-try skips it; mpv then
-# falls back to direct ALSA via the /dev/snd bind.
-RUNTIME_DIR="/run/user/$(id -u)"
-
-# env vars to pass into the sandbox. whitespace-only keys are truthy but
-# produce an empty Bearer token (OpenRouter 401 "Missing Authentication
-# header"); treat them as unset so agent.py's own "PQ_API_KEY is required"
-# error fires instead. the :- default matters: this script runs with set -u.
+# TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID are the phone channel; the daemon loads
+# them from its .env. Whitespace-only values are treated as unset so agent.py
+# reports "not configured" instead of failing every send with a 404 bot URL.
 ENV_ARGS=()
-if [ -n "${PQ_API_KEY:-}" ] && [ -n "${PQ_API_KEY//[[:space:]]/}" ]; then
-    ENV_ARGS+=(--setenv PQ_API_KEY "$PQ_API_KEY")
+for name in PQ_MODEL PQ_API_KEY PQ_PLAYWRIGHT PQ_BROWSER_BACKEND; do
+    if [ -n "${!name:-}" ]; then
+        ENV_ARGS+=(--setenv "$name" "${!name}")
+    fi
+done
+for name in TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID; do
+    if [ -n "${!name:-}" ] && [ -n "${!name//[[:space:]]/}" ]; then
+        ENV_ARGS+=(--setenv "$name" "${!name}")
+    fi
+done
+
+# OpenCode browse: the CLI, its XDG state, and one shared screenshot folder are
+# bound into the sandbox so the relay started inside it sees the pairing the
+# operator made on the host. Pairing tokens live in ~/.local/share/browse, so
+# binding that folder is what makes an already-paired Chrome work here.
+# AUTO_UPDATE/UPDATE_CHECK are off because the binary is read-only inside, and
+# MCP_DIRECT skips the supervisor that would try to swap it. Every path is
+# optional: a host without browse (or PQ_BROWSER_BACKEND=legacy) falls back to
+# mcp_server.js over CDP, and a Raspberry Pi never gets here at all.
+BROWSE_BIN="${HOME}/.local/bin/browse"
+BROWSE_FILES_DIR="/tmp/pq_browse_files"
+mkdir -p -m 700 "$BROWSE_FILES_DIR"
+ENV_ARGS+=(--setenv OPENCODE_BROWSER_FILE_ROOTS "/workspace:$BROWSE_FILES_DIR"
+           --setenv OPENCODE_BROWSER_AUTO_UPDATE "off"
+           --setenv OPENCODE_BROWSER_UPDATE_CHECK "0"
+           --setenv OPENCODE_BROWSER_MCP_DIRECT "1")
+
+# Preflight: agent.py reports which backend it actually chose, but that line
+# scrolls away, and "web tools fell back to CDP" is the one failure worth
+# reading after the fact. These paths are host paths, so this is the only place
+# that can see them at all.
+if [ -x "$BROWSE_BIN" ]; then
+    echo "browse bin : $BROWSE_BIN ($("$BROWSE_BIN" --version 2>/dev/null | head -1))"
+else
+    echo "browse bin : absent at $BROWSE_BIN; web mode 1 falls back to mcp_server.js over CDP"
 fi
-if [ -n "${TELEGRAM_BOT_TOKEN:-}" ]; then
-    ENV_ARGS+=(--setenv TELEGRAM_BOT_TOKEN "$TELEGRAM_BOT_TOKEN")
+if [ -f "${HOME}/.local/share/browse/browser-tokens.json" ]; then
+    echo "browse pair: state in ${HOME}/.local/share/browse"
+else
+    echo "browse pair: no tokens in ${HOME}/.local/share/browse; run 'browse pair' on the host"
 fi
-if [ -n "${TELEGRAM_CHAT_ID:-}" ]; then
-    ENV_ARGS+=(--setenv TELEGRAM_CHAT_ID "$TELEGRAM_CHAT_ID")
+
+# A relay left running on the host is joined rather than started, and two
+# problems follow: a relay from a newer binary rejects this session's client
+# with a version mismatch, and screenshots are written under the host's /tmp,
+# which the sandbox cannot read. Stop it so this session starts its own inside.
+# The cost is that any other browse user on the host loses its relay too.
+# Matching on /proc/<pid>/comm, not just the command line: a bare pkill -f also
+# matches any shell whose arguments contain "browse serve", including a caller.
+stopped_relay=0
+for pid in $(pgrep -f "browse serve" 2>/dev/null || true); do
+    [ "$pid" = "$$" ] && continue
+    if [ "$(cat "/proc/$pid/comm" 2>/dev/null || true)" = "browse" ]; then
+        kill "$pid" 2>/dev/null && stopped_relay=1
+    fi
+done
+if [ "$stopped_relay" = 1 ]; then
+    echo "browse relay: stopped the host-side relay so this session owns it"
+    sleep 1
+fi
+
+EXTRA_ARGS=()
+if [ "$ENABLE_AUDIO" = 1 ]; then
+    # The entire runtime directory exposes PipeWire, microphone and dbus access.
+    RUNTIME_DIR="/run/user/$(id -u)"
+    EXTRA_ARGS+=(--dev-bind-try /dev/snd /dev/snd
+                 --bind-try "$RUNTIME_DIR" "$RUNTIME_DIR"
+                 --setenv XDG_RUNTIME_DIR "$RUNTIME_DIR")
+fi
+if [ "$ENABLE_MUSIC" = 1 ]; then
+    EXTRA_ARGS+=(--ro-bind-try "${HOME}/Music" /music --setenv MUSIC_ROOT /music)
+fi
+if [ "$ENABLE_HF_CACHE" = 1 ]; then
+    # Read-only host models; downloads need a writable cache selected by the task.
+    EXTRA_ARGS+=(--ro-bind-try "${HOME}/.cache/huggingface" /hf-cache
+                 --setenv HF_HOME /hf-cache
+                 --setenv HUGGINGFACE_HUB_CACHE /hf-cache/hub
+                 --setenv TRANSFORMERS_CACHE /hf-cache/hub
+                 --setenv HF_MODULES_CACHE /tmp/hf_modules)
+fi
+if [ "$HF_OFFLINE" = 1 ]; then
+    EXTRA_ARGS+=(--setenv HF_HUB_OFFLINE 1)
+fi
+if [ "$ENABLE_GPU" = 1 ]; then
+    # Globs expand against the host /dev before bwrap starts; a pattern with no
+    # match stays literal and the -e test drops it.
+    for dev in /dev/nvidia[0-9]* /dev/nvidiactl /dev/nvidia-modeset /dev/nvidia-uvm \
+               /dev/nvidia-uvm-tools /dev/nvidia-caps /dev/dri/render*; do
+        [ -e "$dev" ] && EXTRA_ARGS+=(--dev-bind "$dev" "$dev")
+    done
+fi
+
+# .pq is where an operator can leave harness-side material (held-out checks) that
+# the agent must not read. Shadow it with an empty tmpfs when the project has one.
+# When it does not, add nothing: --tmpfs also creates its mount point, which left
+# an empty .pq in every project directory the launcher ran against. bwrap cannot
+# hide the name itself, so a screened .pq is still listed as an empty directory.
+# A symlink or a plain file cannot be screened (mount follows the link to a path
+# that does not exist inside the sandbox), so refuse the run rather than let the
+# agent read it; the bwrap failure alone says only "Can't mount tmpfs on ...".
+PQ_ARGS=()
+if [ -L "$PROJECT_DIR/.pq" ]; then
+    echo "error: $PROJECT_DIR/.pq is a symlink and cannot be screened; use a real directory" >&2
+    exit 1
+elif [ -e "$PROJECT_DIR/.pq" ] && [ ! -d "$PROJECT_DIR/.pq" ]; then
+    echo "error: $PROJECT_DIR/.pq is not a directory and cannot be screened" >&2
+    exit 1
+elif [ -d "$PROJECT_DIR/.pq" ]; then
+    PQ_ARGS+=(--tmpfs /workspace/.pq)
 fi
 
 echo "agent dir  : $AGENT_DIR"
 echo "project dir: $PROJECT_DIR"
-echo "model      : pinned in agent.py"
-echo "playwright : always on (CDP to host Chrome)"
+echo "model      : ${PQ_MODEL:-(default)}"
+echo "web mode   : ${PQ_PLAYWRIGHT:-1 (default: 1=Chrome browser, 2=lite HTTP, 0=none)}"
+echo "host extras: audio=$ENABLE_AUDIO music=$ENABLE_MUSIC hf_cache=$ENABLE_HF_CACHE hf_offline=$HF_OFFLINE gpu=$ENABLE_GPU"
+if [ ${#PQ_ARGS[@]} -gt 0 ]; then
+    echo ".pq        : present in the project, screened behind an empty tmpfs"
+fi
 if [ -n "${TELEGRAM_BOT_TOKEN:-}" ] && [ -n "${TELEGRAM_CHAT_ID:-}" ]; then
     echo "telegram   : configured"
 else
-    echo "telegram   : not set"
+    echo "telegram   : not set (no send_telegram tool)"
 fi
-echo ""
 
+# No Playwright browser-cache bind is needed: the server connects over CDP and
+# does not launch a downloaded browser. Private temporary files remain writable.
 exec bwrap \
   --ro-bind /usr /usr \
   --ro-bind-try /bin /bin \
@@ -97,44 +198,31 @@ exec bwrap \
   --ro-bind /etc /etc \
   --proc /proc \
   --dev /dev \
-  `# sound: direct ALSA access to the host audio hardware (headphones/speakers)` \
-  --dev-bind-try /dev/snd /dev/snd \
   --tmpfs /dev/shm \
   --tmpfs /tmp \
+  --ro-bind-try "$BROWSE_BIN" /tmp/.local/bin/browse \
+  --bind "$BROWSE_FILES_DIR" "$BROWSE_FILES_DIR" \
+  --bind-try "${HOME}/.config/browse" /tmp/.config/browse \
+  --bind-try "${HOME}/.local/share/browse" /tmp/.local/share/browse \
+  --bind-try "${HOME}/.local/state/browse" /tmp/.local/state/browse \
+  --bind-try "${HOME}/.cache/browse" /tmp/.cache/browse \
   --tmpfs /home \
   --tmpfs /root \
   --tmpfs /run \
-  `# sound: host user-session sockets (PipeWire/PulseAudio/dbus); absent when
-   # no desktop session is logged in - mpv then falls back to ALSA` \
-  --bind-try "$RUNTIME_DIR" "$RUNTIME_DIR" \
   --ro-bind-try /run/systemd/resolve /run/systemd/resolve \
-  `# agent code is read-only - the agent cannot modify itself` \
   --ro-bind "$AGENT_DIR" /agent \
-  `# project dir is the only writable location` \
   --bind "$PROJECT_DIR" /workspace \
-  `# shadow .pq with empty tmpfs so agent cannot read harness files` \
-  --tmpfs /workspace/.pq \
-  `# HF caches commonly used by huggingface_hub / transformers` \
-  --ro-bind-try "${HOME}/.cache/huggingface" /hf-cache \
-  `# music library: host ~/Music is bound read-only at /music - the agent plays
-   # from it but can never edit it, and the files stay out of the workdir` \
-  --ro-bind-try "${HOME}/Music" /music \
+  "${PQ_ARGS[@]}" \
   --unshare-pid \
   --unshare-ipc \
   --unshare-uts \
   --die-with-parent \
   --new-session \
   --clearenv \
-  --setenv PATH /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+  --setenv PATH /tmp/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
   --setenv HOME /tmp \
   --setenv TMPDIR /tmp \
-  --setenv XDG_RUNTIME_DIR "$RUNTIME_DIR" \
-  --setenv HF_HOME /hf-cache \
-  --setenv HUGGINGFACE_HUB_CACHE /hf-cache/hub \
-  --setenv TRANSFORMERS_CACHE /hf-cache/hub \
-  --setenv HF_HUB_OFFLINE 1 \
-  --setenv HF_MODULES_CACHE /tmp/hf_modules \
-  --setenv MUSIC_ROOT /music \
+  "${EXTRA_ARGS[@]}" \
   "${ENV_ARGS[@]}" \
   --chdir /workspace \
   -- \
