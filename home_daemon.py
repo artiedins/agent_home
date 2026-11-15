@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import os
+import shutil
 import sys
 import time
 import traceback
@@ -36,17 +37,18 @@ import weather_station
 # How often to poll telegram (seconds). Longer = less battery/cpu but slower response.
 POLL_TIMEOUT = 10
 
-# Where downloaded Telegram media is written (created on start if missing).
-MEDIA_DIR = "media"
-
-# Telegram iPhone/Android push-to-talk notes arrive as message.voice (Ogg Opus).
-# Anything else (photos, docs, music attachments, video notes) is refused.
-ACCEPTED_MEDIA_TYPE = "voice"
-ACCEPTED_MIME_MARKERS = ("ogg", "opus")
+# Telegram iPhone/Android push-to-talk notes arrive as message.voice (Ogg Opus),
+# are transcribed locally, and are unlinked before handoff. Photos, documents,
+# audio, and video attachments land directly in life/inbox_media/ for the agent
+# to inspect, file into /workspace, or delete.
+VOICE_MEDIA_TYPE = "voice"
+VOICE_MIME_MARKERS = ("ogg", "opus")
+ATTACHMENT_MEDIA_TYPES = ("photo", "document", "audio", "video", "video_note")
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 LIFE_DIR = os.path.join(ROOT, "life")
-HARNESS_RUN = os.path.join(ROOT, "harness", "run_agent.sh")
+INBOX_MEDIA_DIR = os.path.join(LIFE_DIR, "inbox_media")
+HARNESS_RUN = "/home/artie/Projects/pq_agent/run_agent.sh"
 # Agent stdout/stderr capture, one file per run appended. It sits in the
 # daemon's own tree, outside the notebook the model reads (life/ is mounted at
 # /workspace, this file is not), and beside daemon.log so one command follows
@@ -117,7 +119,11 @@ def ensure_life():
     if not os.path.isfile(project):
         # Bare fallback if the checked-in constitution is missing.
         with open(project, "w", encoding="utf-8") as f:
-            f.write("You help the user with personal notes and next actions. " "This directory (/workspace) is yours to organize. " "Use send_telegram for short replies.\n")
+            f.write(
+                "You help the user with personal notes and next actions. This directory (/workspace) is yours to organize; "
+                "move durable files out of inbox_media/ into organized folders or delete disposable ones after handling them. "
+                "Use python3 skills/telegram/telegram.py send for short replies.\n"
+            )
         log(f"Wrote default {project}")
 
 
@@ -168,12 +174,15 @@ def write_inbox_message(text, source, meta):
 
 
 def agent_env():
-    # Inherit process env (dotenv-loaded). The model and browser tools are
-    # pinned in harness/agent.py; scrub PQ_MODEL/PQ_PLAYWRIGHT so a value
-    # inherited from an outer coding harness cannot leak into phone helper jobs.
+    # Inherit process env (dotenv-loaded). Leave PQ_MODEL unset so the unified
+    # harness default (go-dsv41f) governs every run; scrub any inherited PQ_MODEL
+    # and configure unified harness mode flags explicitly for the life daemon.
     env = os.environ.copy()
     env.pop("PQ_MODEL", None)
-    env.pop("PQ_PLAYWRIGHT", None)
+    env["PQ_PLAYWRIGHT"] = "1"
+    env["PQ_BROWSE_ASSIST"] = "0"
+    env["PQ_PREVIOUS_SESSIONS"] = "0"
+    env["PQ_LIVE_INBOX"] = "1"
     # Normalize PQ_API_KEY: a whitespace-only value is truthy, so it sails past
     # run_agent.sh's -n test and agent.py's key check and yields an
     # "Authorization: Bearer " header with an empty token -> OpenRouter 401
@@ -353,13 +362,13 @@ def process_timers(ctx):
 
 
 def is_accepted_voice(msg):
-    if (msg.media_type or "") != ACCEPTED_MEDIA_TYPE:
+    if (msg.media_type or "") != VOICE_MEDIA_TYPE:
         return False
     mime = (msg.mime_type or "").lower()
     if not mime:
         # Telegram nearly always sets audio/ogg for voice; allow empty only as fallback.
         return True
-    return any(marker in mime for marker in ACCEPTED_MIME_MARKERS)
+    return any(marker in mime for marker in VOICE_MIME_MARKERS)
 
 
 def safe_unlink(path):
@@ -378,14 +387,69 @@ def reject_media(ctx, msg):
     kind = msg.media_type or "media"
     mime = msg.mime_type or "?"
     log(f"Rejected media type={kind} mime={mime}")
-    # If an older path left a download, wipe it.
     safe_unlink(msg.local_path)
     msg.local_path = ""
-    ctx.send(f"Unsupported media ({kind}, mime={mime}). " "Send a Telegram voice note only (Ogg Opus). " "Photos, video, files, and music attachments are ignored.")
+    ctx.send(f"Unsupported media ({kind}, mime={mime}).")
+
+
+def process_attachment(ctx, client, msg):
+    os.makedirs(INBOX_MEDIA_DIR, exist_ok=True)
+    path = msg.local_path
+    if not path:
+        try:
+            path = client.download_media(msg)
+            msg.local_path = path
+        except TelegramClientError as e:
+            log(f"Attachment download failed ({msg.media_type}): {e}")
+            ctx.send(f"Got {msg.media_type} attachment but failed to download it: {e}")
+            return
+
+    base = os.path.basename(path)
+    staged_path = os.path.join(INBOX_MEDIA_DIR, base)
+    try:
+        if os.path.abspath(path) != os.path.abspath(staged_path):
+            shutil.move(path, staged_path)
+            msg.local_path = staged_path
+        size = os.path.getsize(staged_path)
+    except OSError as e:
+        log(f"Failed placing attachment in {staged_path}: {e}")
+        ctx.send(f"Failed placing {msg.media_type} attachment for agent: {e}")
+        return
+
+    rel_path = os.path.join("inbox_media", base)
+    caption = (msg.caption or "").strip()
+    details = [
+        f"Attached {msg.media_type}: `{rel_path}`",
+        f"MIME type: {msg.mime_type or 'application/octet-stream'}",
+        f"Size: {size} bytes",
+    ]
+    if msg.duration:
+        details.append(f"Duration: {msg.duration}s")
+    if caption:
+        details.append("")
+        details.append(caption)
+    else:
+        details.append("")
+        details.append(f"(No caption supplied with {msg.media_type}.)")
+
+    log(f"Attachment staged type={msg.media_type} path={staged_path} bytes={size} mime={msg.mime_type}")
+    handoff_to_agent(
+        ctx,
+        "\n".join(details),
+        source=msg.media_type,
+        meta={
+            "message_id": msg.message_id,
+            "received_at": local_now_iso(),
+            "media_path": rel_path,
+            "mime_type": msg.mime_type,
+            "file_size": size,
+        },
+    )
 
 
 def process_voice(ctx, client, msg):
     # Download only after acceptance so junk never lands on disk.
+    os.makedirs(INBOX_MEDIA_DIR, exist_ok=True)
     path = msg.local_path
     if not path:
         try:
@@ -445,10 +509,13 @@ def process_voice(ctx, client, msg):
 
 
 def process_media(ctx, client, msg):
-    if not is_accepted_voice(msg):
-        reject_media(ctx, msg)
+    if is_accepted_voice(msg):
+        process_voice(ctx, client, msg)
         return
-    process_voice(ctx, client, msg)
+    if (msg.media_type or "") in ATTACHMENT_MEDIA_TYPES:
+        process_attachment(ctx, client, msg)
+        return
+    reject_media(ctx, msg)
 
 
 def process_message(ctx, client, msg):
@@ -493,14 +560,13 @@ def process_message(ctx, client, msg):
 def main():
     log("Starting home automation daemon...")
     log(f"STT model={transcribe.MODEL} device={transcribe.DEVICE} dtype={transcribe.DTYPE} " f"(lazy-load on first voice note)")
-    log(f"Agent harness={HARNESS_RUN} life={LIFE_DIR} " f"model+browser tools pinned in harness/agent.py, PQ_API_KEY from daemon env")
+    log(f"Agent harness={HARNESS_RUN} life={LIFE_DIR} " f"model default from unified harness, PQ_API_KEY from daemon env")
     log(f"Agent stdout capture: {AGENT_LOG} (appended, never rotated)")
 
-    os.makedirs(MEDIA_DIR, exist_ok=True)
-    log(f"Media directory: {os.path.abspath(MEDIA_DIR)}")
     ensure_life()
     os.makedirs(INBOX_DIR, exist_ok=True)
-    log(f"Live-agent inbox: {INBOX_DIR}")
+    os.makedirs(INBOX_MEDIA_DIR, exist_ok=True)
+    log(f"Live-agent inbox: {INBOX_DIR} (media dir: {INBOX_MEDIA_DIR})")
 
     # Weather station ingest. In its own thread so the one command
     # `nohup python3 -u home_daemon.py &` covers Telegram and the roof station
@@ -512,7 +578,7 @@ def main():
         log(f"ERROR: missing agent launcher {HARNESS_RUN}")
         sys.exit(1)
 
-    client = TelegramClient(media_dir=MEDIA_DIR)
+    client = TelegramClient(media_dir=INBOX_MEDIA_DIR)
     if not client.is_registered():
         log("ERROR: Telegram not configured. Run telegram setup first.")
         sys.exit(1)
@@ -530,7 +596,7 @@ def main():
     ws_note = (
         f"Weather station ingest listening on port {weather_station.PORT}." if weather_station.LISTENER is not None else f"Weather station ingest NOT started (port {weather_station.PORT} busy?)."
     )
-    ctx.send(f"Home daemon started. {ws_note} Send 'help' for house commands. " "Voice notes and freeform text go to the life helper agent.")
+    ctx.send(f"Home daemon started. {ws_note} Send 'help' for house commands. Voice notes, photos, files, and freeform text go to the life helper agent.")
 
     while True:
         try:
