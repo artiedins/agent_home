@@ -411,11 +411,11 @@ def timer_ws_health(ctx, timer):
     )
 
 
-# Inside/outside crossings. This was a 30 s poll, which cost a DB read every half
-# minute for a check whose debounce is 15 minutes per direction: a crossing could
-# wait up to 5 minutes without changing any alert that got sent. Threshold,
-# per-direction debounce, and the state file are in temp_transition.
-TEMP_ALERT_POLL_SEC = 5 * 60
+# Inside/outside crossings. Every 15 min since 2026-11-15 (5 min before, 30 s
+# before that): the per-direction debounce is an hour, so a crossing waiting one
+# interval for its check costs nothing but a delay on the phone. Threshold,
+# debounce, and the state file are in temp_transition.
+TEMP_ALERT_POLL_SEC = 15 * 60
 
 
 def schedule_temp_alert():

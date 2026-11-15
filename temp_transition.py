@@ -5,12 +5,12 @@
 # above the piano); temp_out_c is the roof array. Values are stored Celsius, the
 # threshold and the message are Fahrenheit to match the console display.
 #
-# Rule (set by the owner, 2026-11-08): alert when outside is at least 1.0 F
-# above inside, and when it is at least 1.0 F below inside. Between -1 and +1
-# is a dead band, so a crossing has to clear a full degree before it counts.
-# Each direction has its own 15-minute debounce: a warm-then-cold round trip
-# alerts twice, one message per direction, as long as 15 minutes separate two
-# alerts in the same direction.
+# Rule (owner's call, 2026-11-15; it was 1.0 F / 15 min before): alert when
+# outside is at least 2.0 F above inside, and when it is at least 2.0 F below
+# inside. Between -2 and +2 is a dead band, so a crossing has to clear two
+# degrees before it counts. Each direction has its own one-hour debounce: a
+# warm-then-cold round trip alerts twice, one message per direction, as long as
+# an hour separates two alerts in the same direction.
 #
 # State lives in temp_transition_state.json, not memory, for two reasons: the
 # daemon is restarted by hand after edits, and a restart must not re-announce a
@@ -37,7 +37,15 @@ DEAD_BAND = "dead_band"
 # after a daemon restart the backlog can be hours old, and "outside is warmer
 # than inside" about this morning is noise. The side still advances, so the
 # fresh data that follows does not look like a new crossing.
-STALE_SEC = 15 * 60
+#
+# Keep this comfortably above the poll interval in commands.TEMP_ALERT_POLL_SEC
+# (15 min since 2026-11-15). A crossing is only seen at the next poll, so its
+# report is already up to one interval old by then: replayed over nine days of
+# real reports, ages at check time reached 894 s. A 15-minute cutoff beside a
+# 15-minute poll therefore left no slack, and one poll that fired a few seconds
+# late dropped the alert. Two intervals still discards a restart backlog older
+# than half an hour.
+STALE_SEC = 30 * 60
 
 # Rows pulled per check. Normal operation is one row per 60 s; this only matters
 # when draining a long backlog, and the remainder is picked up next check.
@@ -46,8 +54,8 @@ BATCH = 20000
 
 @dataclass(frozen=True)
 class Settings:
-    threshold_f: float = 1.0
-    debounce_sec: int = 15 * 60
+    threshold_f: float = 2.0
+    debounce_sec: int = 60 * 60
     stale_sec: int = STALE_SEC
     db_path: str = weather_station.DB_PATH
     state_path: str = STATE_PATH
@@ -153,7 +161,7 @@ def _clock(local_time):
         return local_time or "unknown time"
 
 
-def render_message(sample, side, threshold_f=1.0):
+def render_message(sample, side, threshold_f=2.0):
     warmer = side == ABOVE
     headline = "Outside is now warmer than inside" if warmer else "Outside is now colder than inside"
     return "\n".join(
@@ -186,7 +194,7 @@ def status(settings=None, now=None):
     now = time.time() if now is None else now
     state = load_state(settings.state_path)
     if state["last_obs_id"] is None:
-        return "no state yet: the first check runs 30 s after the daemon starts, silently"
+        return "no state yet: the first check runs one poll interval after the daemon starts, silently"
     sent = state["sent"]
     return "outside %s, last above alert %s, last below alert %s" % (
         state["side"],
