@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 
 import os
+import queue
 import shutil
 import sys
+import threading
 import time
 import traceback
 import subprocess
@@ -26,7 +28,7 @@ except ImportError:
     pass
 
 from telegram import TelegramClient
-from telegram.client import TelegramClientError
+from telegram.client import TelegramClientError, TelegramPermanentError
 
 import timers
 import rheem_api
@@ -44,6 +46,18 @@ POLL_TIMEOUT = 10
 VOICE_MEDIA_TYPE = "voice"
 VOICE_MIME_MARKERS = ("ogg", "opus")
 ATTACHMENT_MEDIA_TYPES = ("photo", "document", "audio", "video", "video_note")
+
+# A phone photo arrives over a home uplink that stalls for tens of seconds at a
+# time. daemon.log 2026-11-20 06:19: two photos, sent right after a voice note,
+# each died on a single 30 s read timeout from getFile; nothing retried, the
+# update carrying them had already been confirmed to Telegram, so both were
+# gone and the waiting agent sat 30 min on an empty inbox_media/. So the fetch
+# runs on its own thread with spaced retries, and the daemon keeps polling
+# Telegram meanwhile instead of going deaf for the length of the stall.
+# Delays between attempts; the sum (~9 min) is the retry window.
+ATTACHMENT_RETRY_SEC = (0, 5, 20, 60, 180, 300)
+_download_jobs = queue.Queue()
+_attachment_results = queue.Queue()
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 LIFE_DIR = os.path.join(ROOT, "life")
@@ -392,17 +406,104 @@ def reject_media(ctx, msg):
     ctx.send(f"Unsupported media ({kind}, mime={mime}).")
 
 
-def process_attachment(ctx, client, msg):
-    os.makedirs(INBOX_MEDIA_DIR, exist_ok=True)
-    path = msg.local_path
-    if not path:
-        try:
-            path = client.download_media(msg)
-            msg.local_path = path
-        except TelegramClientError as e:
-            log(f"Attachment download failed ({msg.media_type}): {e}")
-            ctx.send(f"Got {msg.media_type} attachment but failed to download it: {e}")
+def tell_live_agent(text, meta=None):
+    # Only a run that is already alive can act on this. Spawning a fresh run to
+    # report a failed download would put an unasked-for message on the phone,
+    # and the phone is told directly anyway.
+    if _agent_proc is None or _agent_proc.poll() is not None:
+        return False
+    try:
+        path = write_inbox_message(text, "attachment-error", meta or {})
+    except OSError as e:
+        log(f"Could not tell the live agent about the failed attachment: {e}")
+        return False
+    log(f"Told the live agent about the failed attachment: {path}")
+    return True
+
+
+def attachment_worker(client, jobs, results, log_fn):
+    # One download at a time, in arrival order. Runs on its own TelegramClient
+    # so nothing here touches the poller's update offset.
+    while True:
+        msg = jobs.get()
+        if msg is None:
             return
+        path = ""
+        error = ""
+        permanent = False
+        for attempt, delay in enumerate(ATTACHMENT_RETRY_SEC, start=1):
+            if delay:
+                time.sleep(delay)
+            try:
+                path = client.download_media(msg)
+                error = ""
+                if attempt > 1:
+                    log_fn(f"Attachment fetch recovered on attempt {attempt} ({msg.media_type} msg={msg.message_id})")
+                break
+            except TelegramPermanentError as e:
+                # Telegram answered and refused (expired file_id, over the 20 MB
+                # bot limit). Waiting changes nothing.
+                error = str(e)
+                permanent = True
+                log_fn(f"Attachment fetch refused ({msg.media_type} msg={msg.message_id}): {e}")
+                break
+            except Exception as e:
+                # Anything else (timeouts, dropped connections, a full disk) is
+                # worth the next slot in the schedule; the worker must never die
+                # on one bad file, or every later attachment queues forever.
+                error = str(e)
+                log_fn(
+                    f"Attachment fetch attempt {attempt}/{len(ATTACHMENT_RETRY_SEC)} failed "
+                    f"({msg.media_type} msg={msg.message_id}): {type(e).__name__}: {e}"
+                )
+        results.put((msg, path, error, permanent))
+
+
+def process_attachment(ctx, client, msg):
+    # The fetch is queued rather than done here: see ATTACHMENT_RETRY_SEC.
+    if not msg.local_path:
+        log(f"Queued {msg.media_type} download msg={msg.message_id}")
+        _download_jobs.put(msg)
+        return
+    stage_attachment(ctx, msg, msg.local_path)
+
+
+def drain_attachments(ctx):
+    while True:
+        try:
+            msg, path, error, permanent = _attachment_results.get_nowait()
+        except queue.Empty:
+            return
+        stage_attachment(ctx, msg, path, error, permanent)
+
+
+def stage_attachment(ctx, msg, path, error="", permanent=False):
+    os.makedirs(INBOX_MEDIA_DIR, exist_ok=True)
+    if error or not path:
+        # Telegram has already confirmed this update, so there is nothing left
+        # to retry from: say so plainly and offer the resend.
+        log(f"Attachment download gave up ({msg.media_type} msg={msg.message_id} permanent={permanent}): {error}")
+        if permanent:
+            phone = f"Telegram refused that {msg.media_type} ({error}). It did not reach the agent; send it again."
+            note = (
+                f"A {msg.media_type} you sent (Telegram message {msg.message_id}) never arrived: "
+                f"{error}. It is not on disk, so do not go looking for it. "
+                "Ask for a resend if it still matters."
+            )
+        else:
+            minutes = sum(ATTACHMENT_RETRY_SEC) / 60
+            phone = (
+                f"Could not fetch that {msg.media_type} from Telegram after {minutes:.0f} min "
+                "of retries (network timeouts). It did not reach the agent; send it again."
+            )
+            note = (
+                f"A {msg.media_type} you sent (Telegram message {msg.message_id}) never arrived: "
+                f"the download kept timing out ({minutes:.0f} min of retries). "
+                "It is not on disk, so do not go looking for it. Ask for a resend if it still matters."
+            )
+        ctx.send(phone)
+        tell_live_agent(note, {"message_id": msg.message_id, "received_at": local_now_iso()})
+        return
 
     base = os.path.basename(path)
     staged_path = os.path.join(INBOX_MEDIA_DIR, base)
@@ -457,7 +558,7 @@ def process_voice(ctx, client, msg):
             msg.local_path = path
         except TelegramClientError as e:
             log(f"Voice download failed: {e}")
-            ctx.send(f"Got a voice note but failed to download it: {e}")
+            ctx.send("Could not fetch that voice note from Telegram (network timeout). Send it again.")
             return
 
     abs_path = os.path.abspath(path)
@@ -578,10 +679,24 @@ def main():
         log(f"ERROR: missing agent launcher {HARNESS_RUN}")
         sys.exit(1)
 
-    client = TelegramClient(media_dir=INBOX_MEDIA_DIR)
+    client = TelegramClient(media_dir=INBOX_MEDIA_DIR, log=log)
     if not client.is_registered():
         log("ERROR: Telegram not configured. Run telegram setup first.")
         sys.exit(1)
+
+    # Attachment fetches: own client, own thread, spaced retries. The main loop
+    # keeps polling Telegram while a stalled download is retried.
+    download_client = TelegramClient(media_dir=INBOX_MEDIA_DIR, log=log)
+    threading.Thread(
+        target=attachment_worker,
+        args=(download_client, _download_jobs, _attachment_results, log),
+        name="attachment-download",
+        daemon=True,
+    ).start()
+    log(
+        "Attachment downloads: background thread, "
+        f"{len(ATTACHMENT_RETRY_SEC)} attempts over {sum(ATTACHMENT_RETRY_SEC) / 60:.0f} min"
+    )
 
     ctx = Context(_client=client)
 
@@ -610,6 +725,7 @@ def main():
             for msg in messages:
                 process_message(ctx, client, msg)
 
+            drain_attachments(ctx)
             poll_agent()
             reclaim_stranded_inbox(ctx)
 
